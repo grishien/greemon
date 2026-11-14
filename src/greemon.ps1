@@ -665,7 +665,7 @@ function Format-GreemonRequestsTableLines {
 # (условие size.width >= 78 and size.height >= 23 в monitor.py). ---
 
 function Format-GreemonFrame {
-    param($Model, [int]$WindowWidth, [int]$WindowHeight, [bool]$Frozen = $false, [int]$View = 0)
+    param($Model, [int]$WindowWidth, [int]$WindowHeight, [bool]$Frozen = $false, [int]$View = 0, [object[]]$HelpLines = @())
 
     # 3.12: минимум для Overview — 78×23, иначе одна строка.
     if ($WindowWidth -lt 78 -or $WindowHeight -lt 23) {
@@ -721,14 +721,20 @@ function Format-GreemonFrame {
     $tabsLine = Cut-GreemonSegs (Format-GreemonTabsSegs $View $cw) $width
     $ruleLine = @(New-GreemonSeg ($ruleCh * $cw) 'dim')
 
-    # ---- 3.11: строки клавиш и «Read only» (пункт b — без -Url убран)
+    # ---- 3.11: строки клавиш и «Read only» (пункт b — без -Url убран).
+    # 4.3: «?» ставит справку поверх строки сообщения (help_lines в _paint).
     $hintLine = @(New-GreemonSeg ('1-6 views' + '   / filter   Space freeze   r refresh   t theme   ? help   q quit') 'dim')
-    $msgLine = @(New-GreemonSeg 'Read only  |  q quits' 'dim')
+    $msgLines = @()
+    if (@($HelpLines).Count -gt 0) {
+        foreach ($hl in @($HelpLines)) { $msgLines += , @(New-GreemonSeg ([string]$hl) 'dim') }
+    } else {
+        $msgLines += , @(New-GreemonSeg 'Read only  |  q quits' 'dim')
+    }
 
     if ($View -ne 0) {
         # 3.6: в автономном режиме рабочая только вкладка 1
         $stub = @(New-GreemonSeg 'недоступно в автономном режиме')
-        return , (@($headLine, $tabsLine, $ruleLine, @(), $stub, @()) + @($hintLine, $msgLine))
+        return , (@($headLine, $tabsLine, $ruleLine, @(), $stub, @(), $hintLine) + $msgLines)
     }
 
     # ---- 3.7: полоса Model state — в автономном режиме всегда Idle
@@ -854,17 +860,35 @@ function Format-GreemonFrame {
     foreach ($l in $bottomLines) { $lines += , $l }
     $lines += , @()
     $lines += , $hintLine
-    $lines += , $msgLine
+    foreach ($l in $msgLines) { $lines += , $l }
     return , $lines
 }
 
-# Кадры в строки текста с ANSI.
+# Кадры в строки текста с ANSI. Без Pad-* (-Once, 4.5): как в фазе 3 — каждая
+# строка с завершающим переводом. С Pad-* (интерактив, 4.2): каждая строка
+# дополняется пробелами до ширины окна, кадр дополняется пустыми строками до
+# высоты окна (не больше, чтобы не прокручивать альтернативный экран),
+# завершающего перевода у последней строки нет. Благодаря этому кадр после
+# ESC[H перекрывает весь прежний без очистки экрана — мерцания нет.
 function Format-GreemonFrameText {
-    param($Lines)
+    param($Lines, [int]$PadWidth = 0, [int]$PadHeight = 0)
+    $arr = @($Lines)
+    $n = $arr.Count
+    $padded = ($PadWidth -gt 0 -or $PadHeight -gt 0)
+    if ($padded) {
+        if ($PadHeight -gt 0 -and $PadHeight -lt $n) { $n = $PadHeight }   # хвост за экраном всё равно ушёл бы в прокрутку
+        if ($PadHeight -gt $n) { $n = $PadHeight }
+    }
     $sb = New-Object System.Text.StringBuilder
-    foreach ($ln in $Lines) {
-        $null = $sb.Append((Format-GreemonSegs $ln))
-        $null = $sb.Append("`r`n")
+    for ($i = 0; $i -lt $n; $i++) {
+        if ($i) { $null = $sb.Append("`r`n") }
+        $segs = if ($i -lt $arr.Count) { @($arr[$i]) } else { @() }
+        $null = $sb.Append((Format-GreemonSegs $segs))
+        if ($PadWidth -gt 0) {
+            $len = (Get-GreemonPlain $segs).Length
+            if ($len -lt $PadWidth) { $null = $sb.Append(' ' * ($PadWidth - $len)) }
+        }
+        if (-not $padded -and $i -eq $n - 1) { $null = $sb.Append("`r`n") }
     }
     return $sb.ToString()
 }
@@ -1242,28 +1266,234 @@ function Initialize-GreemonData {
 }
 
 # ============================================================================
+# Фаза 4. Цикл и управление (см. roadmap.md).
+# 4.1 — альтернативный экран и скрытый курсор при старте, восстановление
+# (курсор, основной экран, режим консоли, кодировка) в finally при любом
+# выходе, включая ошибку и Ctrl+C; 4.2 — кадр одним [Console]::Out.Write()
+# после ESC[H без очистки экрана; 4.3 — опрос клавиш без блокировки;
+# 4.4 — точный сон по абсолютному расписанию без дрейфа (диапазона -Interval
+# в референсе нет — см. NOTES.md, клампа нет; ноль/отрицательное — ошибка).
+# ============================================================================
+
+# HELP_SECONDS и список клавиш — из monitor.py (_help_line/action_help).
+# Состав клавиш — набор автономной версии (3.11), без Tab/Enter/стрелок.
+$HELP_SECONDS = 15.0
+$GREEMON_HELP_LINE = '1-6 views  / filter  Space freeze  r refresh  t theme  ? help  q quit'
+
+# Опрос клавиш — отдельными тонкими обёртками над [Console], чтобы тесты
+# фазы могли подменить источник клавиш (реальный путь — консоль).
+function Test-GreemonKeyAvailable { return [Console]::KeyAvailable }
+function Read-GreemonKey { return [Console]::ReadKey($true) }
+
+# 4.3: клавиша → действие и новые состояния интерфейса. Ключи $Ui: frozen,
+# view, helpOpen, helpUntil ($null или DateTime UTC), theme.
+# Возвращает: 'quit' | 'refresh' | 'redraw' | '' (клавиша не из набора).
+# Порядок и смысл — BINDINGS/action_* из monitor.py; тема циклом auto→dark→
+# light→auto (action_theme_cycle: terminal→dark→light→terminal).
+function Handle-GreemonUiKey {
+    param($K, $Ui)
+    if ($K.Key -eq [ConsoleKey]::Escape) { $Ui['helpOpen'] = $false; $Ui['helpUntil'] = $null; return '' }
+    $ch = $K.KeyChar
+    if ($ch -eq 'q') { return 'quit' }
+    if ($ch -eq ' ') {
+        $Ui['frozen'] = -not [bool]$Ui['frozen']
+        # как action_freeze: при снятии заморозки сразу показать свежий кадр
+        if (-not [bool]$Ui['frozen']) { return 'refresh' }
+        return 'redraw'
+    }
+    if ($ch -eq 'r') { return 'refresh' }
+    if ($ch -eq 't') {
+        $Ui['theme'] = switch ([string]$Ui['theme']) {
+            'auto' { 'dark' }
+            'dark' { 'light' }
+            default { 'auto' }
+        }
+        $script:ThemeResolved = if ($Ui['theme'] -eq 'light') { 'light' } else { 'dark' }
+        return 'redraw'
+    }
+    if ($ch -eq '?') {
+        # action_help: повторное «?» закрывает; иначе справка на HELP_SECONDS
+        if ([bool]$Ui['helpOpen']) { $Ui['helpOpen'] = $false; $Ui['helpUntil'] = $null }
+        else { $Ui['helpOpen'] = $true; $Ui['helpUntil'] = [DateTime]::UtcNow.AddSeconds($HELP_SECONDS) }
+        return 'redraw'
+    }
+    if ($ch -ge '1' -and $ch -le '6') {
+        # action_view_N; как _set_view: смена вида закрывает справку
+        $Ui['view'] = [int][string]$ch - 1
+        $Ui['helpOpen'] = $false
+        $Ui['helpUntil'] = $null
+        return 'redraw'
+    }
+    return ''
+}
+
+# 4.3: список клавиш для справки — перенос по разделителям «между клавишами»
+# (два пробела), никогда внутри клавиши; _help_wrapped() из monitor.py
+# (room = max(20, width - 2)).
+function Format-GreemonHelpLines {
+    param([string]$Line, [int]$Width)
+    $room = $Width - 2
+    if ($room -lt 20) { $room = 20 }
+    $lines = @()
+    foreach ($item in ($Line -split '  ')) {
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1].Length + 2 + $item.Length -le $room) {
+            $lines[$lines.Count - 1] += '  ' + $item
+        } else {
+            $lines += $item
+        }
+    }
+    return , $lines
+}
+
+# 4.4: абсолютное расписание кадров: следующее время — от *планового* времени
+# предыдущего кадра, поэтому задержки кадра не накапливаются; если отстали,
+# пропущенные кадры пропускаются без «догона» очередью (как set_interval).
+function Get-GreemonNextFrameAt {
+    param([DateTime]$Now, $Prev, [double]$IntervalSec)
+    if ($null -eq $Prev) { return $Now.AddSeconds($IntervalSec) }
+    $t = $Prev
+    while ($t -le $Now) { $t = $t.AddSeconds($IntervalSec) }
+    return $t
+}
+
+# Интерактивный цикл. $Out — поток вывода кадров ([Console]::Out; тесты
+# подают StringWriter). Выход: 'q' (код 0), Ctrl+C (остановка конвейера),
+# ошибка — исключение наружу; восстановление терминала в finally в любом из
+# этих случаев (4.1).
+function Start-GreemonInteractiveLoop {
+    param($Out = $null)
+
+    $null = Initialize-GreemonData
+    Initialize-GreemonRenderOptions
+    $null = Enable-GreemonConsole        # 3.1: VT в консоли
+    $null = Set-GreemonOutputEncoding    # 3.1: UTF-8 без BOM, прежнее помним
+    if ($null -eq $Out) { $Out = [Console]::Out }
+
+    $ui = @{
+        frozen   = $false
+        view     = 0
+        helpOpen = $false
+        helpUntil = $null
+        theme    = $Theme
+    }
+    $model = $null
+    $nextAt = $null
+    $forceSample = $true     # первый кадр снимает данные сразу
+    $dirty = $true           # перерисовать вне планового тика (клавиша/размер)
+
+    try {
+        # 4.1: альтернативный экран и скрытый курсор
+        $Out.Write($ESC + '[?1049h')
+        $Out.Write($ESC + '[?25l')
+        while ($true) {
+            # 4.3: клавиши без блокировки
+            while (Test-GreemonKeyAvailable) {
+                $action = Handle-GreemonUiKey (Read-GreemonKey) $ui
+                if ($action -eq 'quit') { return }
+                if ($action -eq 'refresh') { $forceSample = $true; $dirty = $true }
+                elseif ($action -eq 'redraw') { $dirty = $true }
+            }
+
+            $now = [DateTime]::UtcNow
+            if ($ui['helpOpen'] -and $now -ge $ui['helpUntil']) {
+                $ui['helpOpen'] = $false; $ui['helpUntil'] = $null; $dirty = $true
+            }
+            $due = $forceSample -or ($null -eq $nextAt) -or ($now -ge $nextAt)
+            if ($due) {
+                # «Frozen display» как в референсе: во время заморозки кадр не
+                # обновляется (action_freeze показывает последний снимок)
+                if (-not [bool]$ui['frozen']) {
+                    $sample = New-GreemonSample
+                    $script:LastSample = $sample      # последние значения для модели отрисовки
+                    Add-GreemonSampleToHistory $sample
+                    $model = New-GreemonRenderModel
+                }
+                $winW = 112; $winH = 32    # 3.12: размер окна читается на каждом кадре
+                try { $winW = [Console]::WindowWidth; $winH = [Console]::WindowHeight } catch { }
+                $helpLines = @()
+                if ($ui['helpOpen']) { $helpLines = Format-GreemonHelpLines $GREEMON_HELP_LINE $winW }
+                $lines = Format-GreemonFrame -Model $model -WindowWidth $winW -WindowHeight $winH `
+                    -Frozen ([bool]$ui['frozen']) -View ([int]$ui['view']) -HelpLines $helpLines
+                # 4.2: возврат курсора и весь кадр — одной записью, без очистки
+                $Out.Write($ESC + '[H' + (Format-GreemonFrameText $lines $winW $winH))
+                $nextAt = Get-GreemonNextFrameAt $now $nextAt $Interval
+                $forceSample = $false
+                $dirty = $false
+            }
+            elseif ($dirty -and $null -ne $model) {
+                # перерисовка по клавише/справке без нового замера (расписание не сдвигается)
+                $winW = 112; $winH = 32
+                try { $winW = [Console]::WindowWidth; $winH = [Console]::WindowHeight } catch { }
+                $helpLines = @()
+                if ($ui['helpOpen']) { $helpLines = Format-GreemonHelpLines $GREEMON_HELP_LINE $winW }
+                $lines = Format-GreemonFrame -Model $model -WindowWidth $winW -WindowHeight $winH `
+                    -Frozen ([bool]$ui['frozen']) -View ([int]$ui['view']) -HelpLines $helpLines
+                $Out.Write($ESC + '[H' + (Format-GreemonFrameText $lines $winW $winH))
+                $dirty = $false
+            }
+
+            # сон до следующего кадра; короткие срезы, чтобы клавиши
+            # отзывались быстрее интервала
+            $napMs = 25.0
+            if ($null -ne $nextAt) {
+                $rem = ($nextAt - [DateTime]::UtcNow).TotalMilliseconds
+                if ($rem -lt 1) { $rem = 1 } elseif ($rem -gt $napMs) { $rem = $napMs }
+                $napMs = $rem
+            }
+            [System.Threading.Thread]::Sleep([int]$napMs)
+        }
+    } finally {
+        # 4.1: курсор виден, основной экран, прежний режим консоли и кодировка —
+        # при любом выходе: q, ошибка, Ctrl+C (остановка конвейера выполняет finally).
+        try { $Out.Write($ESC + '[?25h') } catch { }
+        try { $Out.Write($ESC + '[?1049l') } catch { }
+        Restore-GreemonConsole
+    }
+}
+
+# ============================================================================
 # Точка входа. При точечном подключении (. greemon.ps1) определения функций
 # доступны, а запуск не выполняется — так работают проверочные скрипты.
 # ============================================================================
 if ($MyInvocation.InvocationName -ne '.') {
-    # Фаза 3: слой данных + отрисовка Overview. Один кадр на каждый запуск;
-    # интерактивный цикл (альт. экран, клавиши, -Once как режим) — фаза 4.
-    $null = Initialize-GreemonData
-    $null = Invoke-GreemonSampler -IntervalSec $Interval -Iterations 2   # два снимка: CPU % по дельте
-    Initialize-GreemonRenderOptions
-    $model = New-GreemonRenderModel
-    # 3.12: размер окна читается на каждом кадре; при перенаправлении вывода
-    # консольного размера нет — берём типовые 112×32.
-    $winW = 112; $winH = 32
-    try { $winW = [Console]::WindowWidth } catch { }
-    try { $winH = [Console]::WindowHeight } catch { }
-    $lines = Format-GreemonFrame -Model $model -WindowWidth $winW -WindowHeight $winH
-    $null = Enable-GreemonConsole          # 3.1: VT в консоли, если ещё не включён
-    $null = Set-GreemonOutputEncoding      # 3.1: UTF-8 без BOM, прежнее значение помним
-    try {
-        [Console]::Out.Write((Format-GreemonFrameText $lines))
-    } finally {
-        Restore-GreemonConsole             # 3.1: восстановить режим консоли и кодировку
+    if ($Once) {
+        # 4.5: -Once — один кадр в текущий поток вывода, без альтернативного
+        # экрана и без клавиш, код 0 (для тестов).
+        $null = Initialize-GreemonData
+        $null = Invoke-GreemonSampler -IntervalSec $Interval -Iterations 2   # два снимка: CPU % по дельте
+        Initialize-GreemonRenderOptions
+        $model = New-GreemonRenderModel
+        # 3.12: размер окна читается на каждом кадре; при перенаправлении вывода
+        # консольного размера нет — берём типовые 112×32.
+        $winW = 112; $winH = 32
+        try { $winW = [Console]::WindowWidth } catch { }
+        try { $winH = [Console]::WindowHeight } catch { }
+        $lines = Format-GreemonFrame -Model $model -WindowWidth $winW -WindowHeight $winH
+        $null = Enable-GreemonConsole          # 3.1: VT в консоли, если ещё не включён
+        $null = Set-GreemonOutputEncoding      # 3.1: UTF-8 без BOM, прежнее значение помним
+        try {
+            [Console]::Out.Write((Format-GreemonFrameText $lines))
+        } finally {
+            Restore-GreemonConsole             # 3.1: восстановить режим консоли и кодировку
+        }
+        exit 0
     }
+
+    # 4.6: нет интерактивного терминала (вывод или ввод перенаправлен) —
+    # в интерактивный режим не входим, сообщение в stderr, ненулевой код.
+    if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) {
+        [Console]::Error.WriteLine('greemon: интерактивный режим требует терминала (вывод или ввод перенаправлен). ' +
+            'Запустите в терминале или используйте -Once. / greemon: interactive mode needs a terminal ' +
+            '(output or input is redirected). Run in a terminal or use -Once.')
+        exit 2
+    }
+
+    # 4.4: диапазона -Interval в референсе нет (NOTES.md); неотрицательное — ошибка
+    if ($Interval -le 0) {
+        [Console]::Error.WriteLine('greemon: -Interval должен быть больше 0. / greemon: -Interval must be greater than 0.')
+        exit 2
+    }
+
+    Start-GreemonInteractiveLoop
     exit 0
 }
