@@ -174,9 +174,704 @@ public static class GreemonNative
     // Нет в референсе; nvmlDeviceGetMaxPcieLinkWidth по документации NVML (нужно roadmap 2.2).
     [DllImport("nvml.dll")] public static extern int nvmlDeviceGetMaxPcieLinkWidth(IntPtr device, out uint width);
     [DllImport("nvml.dll")] public static extern int nvmlDeviceGetPcieThroughput(IntPtr device, uint counter, out uint valueKbPerSec);
+
+    // ---- 3.1: режим консоли (включить ENABLE_VIRTUAL_TERMINAL_PROCESSING) ----
+    [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetConsoleMode(IntPtr hConsoleOutput, out uint lpMode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetConsoleMode(IntPtr hConsoleOutput, uint dwMode);
 }
 '@
 }
+
+# ============================================================================
+# Фаза 3. Отрисовка Overview (см. roadmap.md).
+#
+# Макет, тексты и форматы — из hwmon\strata_cli\overview.py (build/render),
+# вкладки — из nav.py, выбор глифов — из monitor.py (choose_glyphs), старая
+# консоль — из consoleinfo.py. Ограничения roadmap: Windows PowerShell 5.1,
+# ESC = [char]27, без тернарного оператора и ?..
+# ============================================================================
+
+$ESC = [char]27
+
+# --- 3.1: ANSI/VT. Включить ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004) для
+# stdout, если он в консоли и обработка VT ещё не включена; кодировку вывода
+# поставить UTF-8 без BOM. Оба прежних значения восстановить при выходе. ---
+
+$script:VtStdOut = [IntPtr]::Zero
+$script:VtPrevMode = $null          # прежнее значение флага консоли (для восстановления)
+$script:PrevOutputEncoding = $null  # прежняя [Console]::OutputEncoding
+
+function Enable-GreemonConsole {
+    # Возвращает $true, если VT-последовательности в stdout будут обрабатываться.
+    try {
+        $script:VtStdOut = [GreemonNative]::GetStdHandle(-11)   # STD_OUTPUT_HANDLE
+        $mode = [uint32]0
+        # Не консоль (вывод перенаправлен) или GetConsoleMode недоступен → false;
+        # при перенаправлении VT пишет escape-последовательности в поток как есть.
+        if ($script:VtStdOut -eq [IntPtr]::Zero) { return $false }
+        if (-not [GreemonNative]::GetConsoleMode($script:VtStdOut, [ref]$mode)) { return $false }
+        $script:VtPrevMode = $mode
+        if (($mode -band 0x0004) -eq 0) {
+            return [GreemonNative]::SetConsoleMode($script:VtStdOut, ($mode -bor 0x0004))
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Restore-GreemonConsole {
+    # 3.1: вернуть прежний режим консоли и прежнюю кодировку вывода.
+    if ($null -ne $script:VtPrevMode) {
+        try { $null = [GreemonNative]::SetConsoleMode($script:VtStdOut, $script:VtPrevMode) } catch { }
+        $script:VtPrevMode = $null
+    }
+    if ($null -ne $script:PrevOutputEncoding) {
+        try { [Console]::OutputEncoding = $script:PrevOutputEncoding } catch { }
+        $script:PrevOutputEncoding = $null
+    }
+}
+
+function Set-GreemonOutputEncoding {
+    # UTF-8 без BOM — чтобы псевдографика дорисовывалась; прежнее значение помним.
+    try {
+        $script:PrevOutputEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = (New-Object System.Text.UTF8Encoding($false))
+        return $true
+    } catch { return $false }   # вывод перенаправлен/без ручки — пишем как есть
+}
+
+# --- 3.2: цвета из overview.py truecolor-последовательностями; NO_COLOR — без
+# цвета; в solid-режиме — 16 палитра conhost (SOLID_* в overview.py). ---
+
+# ACCENT/BLUE/AMBER/RED/GREY из overview.py; акцент светлой темы #0c8a60 (render()).
+# yellow — обычный SGR-33 (в rich «bold yellow» у маркера), не truecolor.
+$GREEMON_RGB = @{
+    accent  = '52;211;153'; blue = '90;169;255'; amber = '245;197;107'
+    red     = '242;139;130'; grey = '89;99;107'
+    accent_light = '12;138;96'
+}
+$GREEMON_SGR16 = @{
+    accent = '92'; blue = '94'; amber = '33'; red = '31'; grey = '90'; track = '90'
+}
+
+function Get-GreemonSgr {
+    # Стиль-токены ('bold dim accent' ...) → параметр SGR ('1;38;2;...') или ''.
+    param([string]$Style)
+    if (-not $Style) { return '' }
+    $bold = $false
+    $color = ''
+    foreach ($tok in ($Style -split ' ')) {
+        if ($tok -eq 'bold') { $bold = $true; continue }
+        if ($script:ColorMode -eq 'none') { continue }
+        if ($tok -eq 'yellow') { $color = '33'; continue }
+        if ($tok -eq 'dim' -or $tok -eq 'grey' -or $tok -eq 'track') {
+            if ($script:ColorMode -eq 'solid') { $color = $GREEMON_SGR16['grey'] }
+            else { $color = ('38;2;' + $GREEMON_RGB['grey']) }
+            continue
+        }
+        if ($script:ColorMode -eq 'solid') {
+            if ($GREEMON_SGR16.ContainsKey($tok)) { $color = $GREEMON_SGR16[$tok] }
+        } elseif ($tok -eq 'accent' -and $script:ThemeResolved -eq 'light') {
+            $color = ('38;2;' + $GREEMON_RGB['accent_light'])
+        } elseif ($GREEMON_RGB.ContainsKey($tok)) {
+            $color = ('38;2;' + $GREEMON_RGB[$tok])
+        }
+    }
+    $parts = @()
+    if ($bold) { $parts += '1' }
+    if ($color) { $parts += $color }
+    return ($parts -join ';')
+}
+
+# --- 3.3: три набора глифов. Выбор — как choose_glyphs() из monitor.py;
+# определение старой консоли — как legacy_console() из consoleinfo.py,
+# упрощённо: без переключения шрифта на Cascadia Mono (см. NOTES.md), поэтому
+# старая консоль всегда получает 'solid'. ---
+
+function Test-GreemonLegacyConsole {
+    param([string]$Forced)
+    if ($Forced -eq 'ascii' -or $Forced -eq 'solid') { return $true }    # как forced в legacy_console()
+    if ($Forced -eq 'unicode') { return $false }
+    if ($env:WT_SESSION -or $env:TERM_PROGRAM -or $env:ConEmuANSI -or $env:ANSICON) { return $false }
+    if ($env:TERM -and $env:TERM -match '^(xterm|screen|tmux|vt)') { return $false }
+    return $true    # conhost Windows PowerShell/cmd
+}
+
+function Initialize-GreemonRenderOptions {
+    $legacy = Test-GreemonLegacyConsole -Forced $Glyphs
+    $script:LegacyConsole = $legacy
+    if ($Glyphs -ne 'auto') { $script:GlyphSet = $Glyphs }
+    elseif ($legacy) { $script:GlyphSet = 'solid' }     # без Cascadia-проверки — solid (NOTES.md)
+    else { $script:GlyphSet = 'unicode' }
+    # NO_COLOR как в monitor.py: os.environ.get('NO_COLOR') is not None.
+    $noColor = ($null -ne [Environment]::GetEnvironmentVariable('NO_COLOR'))
+    if ($noColor) { $script:ColorMode = 'none' }
+    elseif ($script:GlyphSet -eq 'solid') { $script:ColorMode = 'solid' }
+    else { $script:ColorMode = 'truecolor' }
+    # auto → terminal у референса; в ANSI без фона terminal рисуется как dark
+    # (акцент остаётся ACCENT — в render() light меняет только его).
+    if ($Theme -eq 'light') { $script:ThemeResolved = 'light' } else { $script:ThemeResolved = 'dark' }
+}
+
+# --- Стиль-сегменты: строка = массив @{t = текст; s = стиль}. Цвет подставляется
+# только при выводе, ширина считается по plain-тексту (3.4: без широких
+# символов и вне BMP — все глифы референса в BMP и одноширинные). ---
+
+function New-GreemonSeg {
+    param([string]$Text, [string]$Style = '')
+    return @{ t = $Text; s = $Style }
+}
+
+function Get-GreemonPlain {
+    param($Segs)
+    if ($null -eq $Segs -or $Segs.Count -eq 0) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($g in $Segs) { $null = $sb.Append($g.t) }
+    return $sb.ToString()
+}
+
+function Format-GreemonSegs {
+    param($Segs)
+    # Сегменты → строка с ANSI; без цвета (ColorMode none) — просто текст.
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($g in $Segs) {
+        $sgr = Get-GreemonSgr $g.s
+        if ($sgr) {
+            $null = $sb.Append($ESC).Append('[').Append($sgr).Append('m')
+            $null = $sb.Append($g.t)
+            $null = $sb.Append($ESC).Append('[0m')
+        } else {
+            $null = $sb.Append($g.t)
+        }
+    }
+    return $sb.ToString()
+}
+
+function Cut-GreemonSegs {
+    # Обрезка строки по ширине в ячейках (overflow="crop" в референсе).
+    param($Segs, [int]$Width)
+    $out = @()
+    $left = $Width
+    foreach ($g in $Segs) {
+        if ($left -le 0) { break }
+        if ($g.t.Length -le $left) { $out += $g } else { $out += (New-GreemonSeg $g.t.Substring(0, $left) $g.s) }
+        $left -= $g.t.Length
+    }
+    return , $out
+}
+
+function Pad-GreemonSegs {
+    # Дополнение строки пробелами до ширины в ячейках.
+    param($Segs, [int]$Width)
+    $len = (Get-GreemonPlain $Segs).Length
+    if ($len -lt $Width) { return , ($Segs + (New-GreemonSeg (' ' * ($Width - $len)))) }
+    return , $Segs
+}
+
+# --- 3.4: форматы чисел из overview.py (fmt / tokens / k). ---
+
+function Format-GreemonNum {
+    # fmt(): None → '--'; иначе f"{v:,.{digits}f}{unit}" (разделитель тысяч,
+    # инвариантная культура — как f-строка в Python).
+    param($V, [int]$Digits = 0, [string]$Unit = '')
+    if ($null -eq $V) { return '--' }
+    $fmt = '#,##0'
+    if ($Digits -gt 0) { $fmt += '.' + ('0' * $Digits) }
+    return ([double]$V).ToString($fmt, [System.Globalization.CultureInfo]::InvariantCulture) + $Unit
+}
+
+function Format-GreemonTokens {
+    param($V)
+    return Format-GreemonNum $V 0
+}
+
+function Format-GreemonK {
+    # k(): None → '--'; >= 1024 → «NNNK», иначе целое.
+    param($V)
+    if ($null -eq $V) { return '--' }
+    $v = [double]$V
+    if ($v -ge 1024) { return ([math]::Round($v / 1024.0)).ToString('#,##0', [System.Globalization.CultureInfo]::InvariantCulture) + 'K' }
+    return ([math]::Round($v)).ToString('#,##0', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+# --- 3.4: спарклайн spark() из overview.py: один ряд блочных символов по
+# последним Width значениям; $null-разрывы → пробел; solid-вид — ▄ (низкая
+# четверть — тонкий track) / ▄ / █. Возвращает сегменты (в solid у ячеек свои
+# стили: track — bright_black). ---
+
+function Format-GreemonSpark {
+    param([object[]]$Values, [int]$Width, [string]$Style = 'accent', $Lo = $null, $Hi = $null)
+    $vals = @($Values)
+    if ($vals.Count -gt $Width) { $vals = $vals[($vals.Count - $Width)..($vals.Count - 1)] }
+    $present = @($vals | Where-Object { $null -ne $_ })
+    $pad = ' ' * ($Width - $vals.Count)
+    if ($present.Count -eq 0) { return , @(New-GreemonSeg (' ' * $Width)) }
+    $low = if ($null -ne $Lo) { [double]$Lo } else { [double](($present | Measure-Object -Minimum).Minimum) }
+    $high = if ($null -ne $Hi) { [double]$Hi } else { [double](($present | Measure-Object -Maximum).Maximum) }
+    if ($high - $low -lt 1e-9) { $high = $low + 1.0 }
+    $ramp = if ($script:GlyphSet -eq 'ascii') { '.:-=+*#@' } else { [string][char]0x2581 + [char]0x2582 + [char]0x2583 + [char]0x2584 + [char]0x2585 + [char]0x2586 + [char]0x2587 + [char]0x2588 }
+    $segs = @()
+    if ($pad) { $segs += New-GreemonSeg $pad }
+    $buf = ''; $bufStyle = $null
+    foreach ($v in $vals) {
+        if ($null -eq $v) { $ch = ' '; $st = '' }
+        elseif ($script:GlyphSet -eq 'solid') {
+            # solid_spark(): f<0.25 → тонкий ▄ (track), f<0.6 → ▄, иначе █
+            $f = ([double]$v - $low) / ($high - $low)
+            if ($f -lt 0.25) { $ch = [string][char]0x2584; $st = 'track' }
+            elseif ($f -lt 0.6) { $ch = [string][char]0x2584 }
+            else { $ch = [string][char]0x2588 }
+        } else {
+            $i = [int][math]::Floor((([double]$v - $low) / ($high - $low)) * 7.999)
+            if ($i -lt 0) { $i = 0 } elseif ($i -gt 7) { $i = 7 }
+            $ch = $ramp[$i].ToString(); $st = ''
+        }
+        if ($null -eq $bufStyle) { $bufStyle = $st }
+        elseif ($st -ne $bufStyle) { if ($buf -ne '') { $segs += New-GreemonSeg $buf $bufStyle }; $buf = ''; $bufStyle = $st }
+        $buf += $ch
+    }
+    if ($buf -ne '') { $segs += New-GreemonSeg $buf $bufStyle }
+    if ($script:GlyphSet -ne 'solid') {
+        # у unicode/ascii спарклайн красится акцентом плитки целиком (в solid
+        # свои стили ячеек уже расставлены; track остаётся track)
+        $out = @()
+        foreach ($g in $segs) { if (-not $g.s) { $out += (New-GreemonSeg $g.t $Style) } else { $out += $g } }
+        return , $out
+    }
+    return , $segs
+}
+
+# --- 3.4: горизонтальная полоса bar() из overview.py. None → пустая дорожка
+# (unicode: ░, ascii: '.', solid: ▄ track). ---
+
+function Format-GreemonBar {
+    param($Frac, [int]$Width, [string]$Style = 'accent')
+    if ($script:GlyphSet -eq 'solid') {
+        $n = 0
+        if ($null -ne $Frac) {
+            $f = [double]$Frac; if ($f -lt 0) { $f = 0 }; if ($f -gt 1) { $f = 1 }
+            $n = [int][math]::Round($f * $Width)
+        }
+        $segs = @()
+        if ($n -gt 0) { $segs += New-GreemonSeg (([string][char]0x2588) * $n) $Style }
+        if ($Width - $n -gt 0) { $segs += New-GreemonSeg (([string][char]0x2584) * ($Width - $n)) 'track' }
+        return , $segs
+    }
+    $full = '█'; $hollow = '░'
+    if ($script:GlyphSet -eq 'ascii') { $full = '#'; $hollow = '.' }
+    if ($null -eq $Frac) { return , @(New-GreemonSeg ($hollow * $Width) 'dim') }
+    $f = [double]$Frac; if ($f -lt 0) { $f = 0 }; if ($f -gt 1) { $f = 1 }
+    $n = [int][math]::Round($f * $Width)
+    $segs = @()
+    if ($n -gt 0) { $segs += New-GreemonSeg ([string]$full * $n) $Style }
+    if ($Width - $n -gt 0) { $segs += New-GreemonSeg ([string]$hollow * ($Width - $n)) 'dim' }
+    return , $segs
+}
+
+# --- 3.4: рамка плитки — Panel из _tile(): скруглённая для unicode
+# (box.ROUNDED), квадратная для ascii/solid (box.SQUARE); заголовок слева
+# внутри верхней границы, padding (0,1), строки: big (bold), sub (dim),
+# спарклайн (акцент). ---
+
+function New-GreemonTile {
+    param([string]$Title, [string]$Big, [string]$Sub, [object[]]$Spark, [int]$Width, [string]$Accent = 'accent')
+    $rounded = $script:GlyphSet -eq 'unicode'
+    $tl = if ($rounded) { [char]0x256D } else { [char]0x250C }     # ╭ ┌
+    $tr = if ($rounded) { [char]0x256E } else { [char]0x2510 }     # ╮ ┐
+    $bl = if ($rounded) { [char]0x2570 } else { [char]0x2514 }     # ╰ └
+    $br = if ($rounded) { [char]0x256F } else { [char]0x2518 }     # ╯ ┘
+    $h = [string][char]0x2500                                     # ─
+    $v = [string][char]0x2502                                     # │
+    $inner = $Width - 4                                           # padding (0,1) + границы
+    # верхняя граница с заголовком: ╭─ Title ─…─╮ (Panel title_align=left)
+    $t = $Title
+    if ($t.Length -gt $inner) { $t = $t.Substring(0, $inner) }
+    $rest = $Width - 5 - $t.Length
+    if ($rest -lt 1) { $rest = 1 }
+    $top = @((New-GreemonSeg ([string]$tl) 'dim'), (New-GreemonSeg ($h + ' ' + $t + ' ') 'dim'), (New-GreemonSeg ($h * $rest) 'dim'), (New-GreemonSeg ([string]$tr) 'dim'))
+    $bodyRow = {
+        param($ContentSegs, [string]$FallbackStyle)
+        $cs = @()
+        foreach ($g in $ContentSegs) { if (-not $g.s) { $cs += (New-GreemonSeg $g.t $FallbackStyle) } else { $cs += $g } }
+        $cs = Pad-GreemonSegs (Cut-GreemonSegs $cs $inner) $inner
+        return , (@(New-GreemonSeg ([string]$v + ' ') 'dim') + $cs + @(New-GreemonSeg (' ' + [string]$v) 'dim'))
+    }
+    $rowBig = & $bodyRow @(New-GreemonSeg $Big 'bold') ''
+    $rowSub = & $bodyRow @(New-GreemonSeg $Sub 'dim') ''
+    $rowSpark = & $bodyRow $Spark $Accent
+    $bottom = @((New-GreemonSeg ([string]$bl) 'dim'), (New-GreemonSeg ($h * ($Width - 2)) 'dim'), (New-GreemonSeg ([string]$br) 'dim'))
+    $rows = @()
+    $rows += , $top
+    $rows += , $rowBig
+    $rows += , $rowSub
+    $rows += , $rowSpark
+    $rows += , $bottom
+    return , $rows
+}
+
+# --- 3.6: панель вкладок — nav.py (NAMES/SHORT, layout/plain/styled). ---
+
+$GREEMON_TABS = @('Overview', 'Serving', 'Requests', 'Engine', 'Hardware', 'Logs')
+$GREEMON_TABS_SHORT = @('Over', 'Serve', 'Reqs', 'Engine', 'GPU', 'Logs')
+
+function Get-GreemonTabsLayout {
+    # nav.layout(current, width, connect=False) для шести вкладок.
+    param([int]$Current, [int]$Width)
+    $n = $GREEMON_TABS.Count
+    if ($Current -lt 0) { $Current = 0 } elseif ($Current -gt $n - 1) { $Current = $n - 1 }
+    foreach ($pair in @(@($GREEMON_TABS, '  '), @($GREEMON_TABS_SHORT, ' '))) {
+        $labels = $pair[0]; $sep = $pair[1]
+        $items = @(); $w = 0
+        for ($i = 0; $i -lt $n; $i++) {
+            $numTxt = [string]($i + 1)
+            $items += $(if ($i -eq $Current) { '[' + $numTxt + ' ' + $labels[$i] + ']' } else { $numTxt + ' ' + $labels[$i] })
+            $w += $items[$i].Length
+        }
+        $w += $sep.Length * ($n - 1)
+        if ($w -le $Width) {
+            $pieces = @(); for ($i = 0; $i -lt $n; $i++) { $pieces += , @($items[$i], ($i -eq $Current)) }
+            return @{ pieces = $pieces; sep = $sep; left = $false; right = $false }
+        }
+    }
+    # не влезает даже список коротких — только вкладки вокруг выбранной (nav.layout)
+    $items = @()
+    for ($i = 0; $i -lt $n; $i++) { $numTxt = [string]($i + 1); $items += $(if ($i -eq $Current) { '[' + $numTxt + ' ' + $GREEMON_TABS_SHORT[$i] + ']' } else { $numTxt + ' ' + $GREEMON_TABS_SHORT[$i] }) }
+    $lo = $Current; $hi = $Current
+    while ($true) {
+        $grew = $false
+        foreach ($pair in @(@(($hi + 1), $true), @(($lo - 1), $false))) {
+            $nxt = $pair[0]; $isHi = $pair[1]
+            if ($nxt -lt 0 -or $nxt -gt $n - 1) { continue }
+            $newLo = $lo; $newHi = $hi
+            if ($isHi) { $newHi = $nxt } else { $newLo = $nxt }
+            $w = 0
+            for ($i = $newLo; $i -le $newHi; $i++) { $w += $items[$i].Length }
+            $w += 1 * ($newHi - $newLo)                       # sep=' '
+            if ($newLo -gt 0) { $w += 2 }
+            if ($newHi -lt $n - 1) { $w += 2 }
+            if ($w -le $Width) { $lo = $newLo; $hi = $newHi; $grew = $true }
+        }
+        if (-not $grew) { break }
+    }
+    $pieces = @(); for ($i = $lo; $i -le $hi; $i++) { $pieces += , @($items[$i], ($i -eq $Current)) }
+    return @{ pieces = $pieces; sep = ' '; left = ($lo -gt 0); right = ($hi -lt $n - 1) }
+}
+
+function Format-GreemonTabsSegs {
+    # nav.styled: выбранная вкладка — bold + акцент, стрелки — dim.
+    param([int]$Current, [int]$Width)
+    $tabs = Get-GreemonTabsLayout $Current $Width
+    $segs = @()
+    if ($tabs.left) { $segs += New-GreemonSeg '< ' 'dim' }
+    for ($i = 0; $i -lt $tabs.pieces.Count; $i++) {
+        if ($i) { $segs += New-GreemonSeg $tabs.sep }
+        $sel = $tabs.pieces[$i][1]
+        $style = if ($sel) { 'bold accent' } else { '' }
+        $segs += New-GreemonSeg $tabs.pieces[$i][0] $style
+    }
+    if ($tabs.right) { $segs += New-GreemonSeg ' >' 'dim' }
+    return , $segs
+}
+
+# --- 3.8: short_gpu() из overview.py — имя карты без префиксов производителя. ---
+
+function Get-GreemonShortGpu {
+    param($Name)
+    if (-not $Name) { return 'graphics card' }
+    foreach ($p in @('NVIDIA GeForce ', 'NVIDIA ', 'AMD Radeon ', 'AMD ', 'Intel(R) ', 'Intel ')) {
+        if ($Name.StartsWith($p)) { $Name = $Name.Substring($p.Length) }
+    }
+    return $Name
+}
+
+# --- Модель отрисовки для автономного режима — порт build() из overview.py на
+# локальных данных (hwmon.py feeds the same shapes from its fake /metrics:
+# live.state=idle, engine.model=label, requests=[], totals={}). Скорость:
+# run_average_speed по пустым totals → None → ветка «last request» (как в
+# референсе автономного hwmon). LLM-числа — $null, плитки показывают '--'. ---
+
+function New-GreemonRenderModel {
+    $s = $script:LastSample
+    $hist = $script:Hist
+    $st = $script:Static
+    $GIB = [math]::Pow(2, 30)
+    $toGiB = { param($x) if ($null -eq $x) { $null } else { [double]$x / $GIB } }
+    $histGiB = @(foreach ($x in @($hist['gpu_mem_used'].ToArray())) { if ($null -eq $x) { $null } else { [double]$x / $GIB } })
+    return @{
+        state        = 'Idle'                       # 3.7: в автономном режиме всегда Idle
+        phase_text   = 'Waiting for a request'      # phase_text['Idle'] в build()
+        queued       = 0
+        progress     = @{ done = $null; total = $null }
+        context      = @{ used = $null; max = $null }
+        speed        = @{ value = $null; note = 'last request' }   # ветка Idle в build() при пустых totals/requests
+        gpu = @{
+            util       = $s['gpu_util'];   util_hist  = @($hist['gpu_util'].ToArray())
+            vram_used  = & $toGiB $s['gpu_mem_used']; vram_total = & $toGiB $(if ($null -ne $s['gpu_mem_total']) { $s['gpu_mem_total'] } else { $st['gpu_vram_total'] })
+            vram_hist  = $histGiB
+            temp       = $s['gpu_temp'];   temp_hist  = @($hist['gpu_temp'].ToArray())
+            power      = $s['gpu_power'];  power_limit = $s['gpu_power_limit']; power_hist = @($hist['gpu_power'].ToArray())
+            pcie_rx    = $s['gpu_pcie_rx_mb']; pcie_hist = @($hist['gpu_pcie_rx_mb'].ToArray())
+            pcie_gen   = $(if ($null -ne $s['gpu_pcie_gen']) { $s['gpu_pcie_gen'] } else { $s['gpu_pcie_gen_max'] })
+            pcie_width = $s['gpu_pcie_width']
+            name       = $st['gpu_name']; count = $st['gpu_count']; cards = @()
+        }
+        cpu  = @{ load = $s['cpu']; hist = @($hist['cpu'].ToArray()); cores = $st['cpu_cores']; threads = $st['cpu_threads']; sockets = $null }
+        disk = @{ read = $s['disk_read_mb']; write = $s['disk_write_mb']; hist = @($hist['disk_read_mb'].ToArray()) }
+        ram  = @{ used = (& $toGiB $s['ram_used']); total = (& $toGiB $s['ram_total']) }
+        experts = @{ slots = $null; total = $null; gb = $null }        # 3.9: в автономном режиме '--'
+        recent  = @()                                                  # 3.10: данных нет до фазы 6
+        sampled_at = $(if ($null -ne $s['time']) { [double]$s['time'] } else { $null })
+    }
+}
+
+# --- 3.10: таблица Recent requests — заголовки и строки, как в render():
+# TIME STATUS PROMPT REUSED OUTPUT TOK/S DURATION; пусто → «No requests yet». ---
+
+function Format-GreemonRequestsTableLines {
+    param($Recent, [int]$ShowRows)
+    $head = @((New-GreemonSeg 'TIME' 'dim'), (New-GreemonSeg '  '), (New-GreemonSeg 'STATUS' 'dim'), (New-GreemonSeg '  '),
+        (New-GreemonSeg 'PROMPT' 'dim'), (New-GreemonSeg '  '), (New-GreemonSeg 'REUSED' 'dim'), (New-GreemonSeg '  '),
+        (New-GreemonSeg 'OUTPUT' 'dim'), (New-GreemonSeg '  '), (New-GreemonSeg 'TOK/S' 'dim'), (New-GreemonSeg '  '),
+        (New-GreemonSeg 'DURATION' 'dim'))
+    $lines = @(, $head)
+    if (@($Recent).Count -eq 0) {
+        $lines += , @(New-GreemonSeg 'No requests yet')
+        return , $lines
+    }
+    # данные запросов появятся с фазами LLM (фаза 6); форматы строк — как в render()
+    foreach ($r in @($Recent | Select-Object -First $ShowRows)) {
+        $stamp = if ($null -ne $r['time']) { [DateTimeOffset]::FromUnixTimeSeconds([long]$r['time']).LocalDateTime.ToString('HH:mm:ss') } else { '--' }
+        $stStyle = switch ($r['state']) { 'Done' { 'accent' } 'Error' { 'red' } default { 'amber' } }
+        $cells = @(
+            (, @(New-GreemonSeg $stamp)),
+            (, @(New-GreemonSeg $r['state'] $stStyle)),
+            (, @(New-GreemonSeg (Format-GreemonTokens $r['prompt']))),
+            (, @(New-GreemonSeg (Format-GreemonTokens $r['reused']))),
+            (, @(New-GreemonSeg (Format-GreemonTokens $r['output']))),
+            (, @(New-GreemonSeg (Format-GreemonNum $r['tps'] 1))),
+            (, @(New-GreemonSeg (Format-GreemonNum $r['duration'] 1 ' s')))
+        )
+        $line = @()
+        for ($i = 0; $i -lt $cells.Count; $i++) { if ($i) { $line += New-GreemonSeg '  ' }; $line += $cells[$i] }
+        $lines += , $line
+    }
+    return , $lines
+}
+
+# --- 3.5–3.12: кадр. Возвращает массив строк-сегментов (каждая строка —
+# массив @{t;s}) или одну строку-заглушку, если окно меньше минимума 78×23
+# (условие size.width >= 78 and size.height >= 23 в monitor.py). ---
+
+function Format-GreemonFrame {
+    param($Model, [int]$WindowWidth, [int]$WindowHeight, [bool]$Frozen = $false, [int]$View = 0)
+
+    # 3.12: минимум для Overview — 78×23, иначе одна строка.
+    if ($WindowWidth -lt 78 -or $WindowHeight -lt 23) {
+        return , @(, @(New-GreemonSeg 'окно слишком маленькое, нужно 78×23'))
+    }
+    # ширина контента — как в monitor.py: width - margin (3 в классической
+    # консоли, иначе 2), далее в render() всё ограничено min(width, 110).
+    $margin = 2
+    if ($script:LegacyConsole) { $margin = 3 }
+    $width = $WindowWidth - $margin
+    if ($width -lt 30) { $width = 30 }
+    if ($script:LegacyConsole -and $width -gt 100) { $width = 100 }
+    $cw = $width
+    if ($cw -gt 110) { $cw = 110 }
+
+    $asciiMode = $script:GlyphSet -eq 'ascii'
+    $dot = '-'; $bullet = '*'; $ruleCh = '-'                  # ascii-вид — чистый ASCII
+    if (-not $asciiMode) {
+        $dot = [string][char]0x00B7                            # ·
+        $ruleCh = [string][char]0x2500                        # ─
+        $bullet = if ($script:GlyphSet -eq 'solid') { [string][char]0x2022 } else { [string][char]0x25CF }   # • / ●
+    }
+
+    $state = $Model['state']
+    # state_color из render(): Idle → без цвета (у нас 'dim' для правого текста)
+    $stateColor = switch ($state) { 'Reading' { 'blue' } 'Generating' { 'accent' } 'Queued' { 'amber' } 'Error' { 'red' } default { '' } }
+
+    # маркер [LIVE]/[STALE]/[FROZEN] (3.5): автономно — connected; LIVE → STALE,
+    # если возраст замера больше 6 секунд (как в render()).
+    $marker = 'LIVE'
+    if ($Frozen) { $marker = 'FROZEN' }
+    if ($null -ne $Model['sampled_at']) {
+        $age = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 - $Model['sampled_at']
+        if ($marker -eq 'LIVE' -and $age -gt 6) { $marker = 'STALE' }
+    }
+
+    # ---- 3.5: шапка. Вместо URL — greemon; на месте модели — -Label.
+    $head = @((New-GreemonSeg 'STRATA  Overview   ' 'bold accent'), (New-GreemonSeg 'greemon   ' 'bold accent'), (New-GreemonSeg $Label 'bold'))
+    $phaseTxt = $bullet + ' ' + $Model['phase_text']
+    $done = $Model['progress']['done']; $total = $Model['progress']['total']
+    $pct = $null
+    if ($null -ne $done -and $total) { $pct = [int][math]::Round(100 * $done / $total) }
+    if ($null -ne $pct -and ($state -eq 'Reading' -or $state -eq 'Generating')) { $phaseTxt += ' ' + $dot + ' ' + $pct + '%' }
+    $right = @((New-GreemonSeg $phaseTxt 'dim'), (New-GreemonSeg '   '), (New-GreemonSeg ('[' + $marker + ']') 'bold accent'))
+    if ($marker -ne 'LIVE') { $right = @((New-GreemonSeg $phaseTxt 'dim'), (New-GreemonSeg '   '), (New-GreemonSeg ('[' + $marker + ']') 'bold yellow')) }
+    $headPlain = (Get-GreemonPlain $head); $rightPlain = (Get-GreemonPlain $right)
+    $pad = $width - $headPlain.Length - $rightPlain.Length
+    if ($pad -lt 2) { $pad = 2 }
+    $headLine = $head + @(New-GreemonSeg (' ' * $pad)) + $right
+    $headLine = Cut-GreemonSegs $headLine $width
+
+    # ---- 3.6: вкладки и линейка
+    $tabsLine = Cut-GreemonSegs (Format-GreemonTabsSegs $View $cw) $width
+    $ruleLine = @(New-GreemonSeg ($ruleCh * $cw) 'dim')
+
+    # ---- 3.11: строки клавиш и «Read only» (пункт b — без -Url убран)
+    $hintLine = @(New-GreemonSeg ('1-6 views' + '   / filter   Space freeze   r refresh   t theme   ? help   q quit') 'dim')
+    $msgLine = @(New-GreemonSeg 'Read only  |  q quits' 'dim')
+
+    if ($View -ne 0) {
+        # 3.6: в автономном режиме рабочая только вкладка 1
+        $stub = @(New-GreemonSeg 'недоступно в автономном режиме')
+        return , (@($headLine, $tabsLine, $ruleLine, @(), $stub, @()) + @($hintLine, $msgLine))
+    }
+
+    # ---- 3.7: полоса Model state — в автономном режиме всегда Idle
+    $st = @(New-GreemonSeg 'Model state  ' 'bold accent')
+    foreach ($n in @('Idle', 'Reading', 'Generating', 'Queued', 'Error')) {
+        $txt = if ($n -eq $state) { '[' + $n + ']' } else { $n }
+        $style = 'dim'
+        if ($n -eq $state -and $state -ne 'Idle') { $style = $stateColor }
+        elseif ($n -eq $state) { $style = 'bold' }
+        $st += New-GreemonSeg ($txt + '  ') $style
+    }
+    $stPad = $cw - (Get-GreemonPlain $st).Length
+    if ($stPad -lt 2) { $stPad = 2 }
+    $stLine = Cut-GreemonSegs ($st + @(New-GreemonSeg (' ' * $stPad) 'dim')) $width
+    $barW = $cw - 2
+    if ($barW -lt 20) { $barW = 20 }
+    $stateBarLine = Format-GreemonBar $null $barW 'accent'
+
+    # ---- 3.8: восемь плиток 4 + 4 (тексты и форматы — из overview.py)
+    $tileW = [int][math]::Floor(($cw - 3) / 4)
+    if ($tileW -lt 18) { $tileW = 18 }
+    $inner = $tileW - 4
+    $g = $Model['gpu']; $c = $Model['cpu']; $d = $Model['disk']
+    $spdStyle = 'accent'
+    $spdBig = '-- tok/s'
+    if ($null -ne $Model['speed']['value']) { $spdBig = (Format-GreemonNum $Model['speed']['value'] 1) + ' tok/s' }
+    $loadBig = (Format-GreemonNum $g['util']) + ' %'
+    $loadSub = Get-GreemonShortGpu $g['name']
+    $vramBig = (Format-GreemonNum $g['vram_used'] 1) + ' / ' + (Format-GreemonNum $g['vram_total'] 0) + ' GB'
+    $vramSub = 'graphics memory'
+    $tempUnit = ' C'; if (-not $asciiMode) { $tempUnit = ' ' + [string][char]0x00B0 + 'C' }
+    $tempBig = (Format-GreemonNum $g['temp']) + $tempUnit
+    $genTxt = if ($g['pcie_gen']) { 'Gen' + [int]$g['pcie_gen'] } else { 'PCIe' }
+    $link = if ($g['pcie_width']) { $genTxt + ' x' + [int]$g['pcie_width'] } else { $genTxt }
+    $pcieSub = 'to GPU --'
+    if ($null -ne $g['pcie_rx']) { $pcieSub = 'to GPU ' + (Format-GreemonNum $g['pcie_rx']) + ' MB/s' }
+    $cpuSub = ''
+    if ($c['cores'] -and $c['threads']) { $cpuSub = [string][int]$c['cores'] + ' cores ' + $dot + ' ' + [string][int]$c['threads'] + ' threads' }
+    elseif ($c['threads']) { $cpuSub = [string][int]$c['threads'] + ' threads' }
+    $powerBig = (Format-GreemonNum $g['power']) + ' W'
+    $powerSub = if ($g['power_limit']) { 'of ' + (Format-GreemonNum $g['power_limit']) + ' W limit' } else { '' }
+    $diskBig = (Format-GreemonNum $d['read'] 1) + ' MB/s'
+    $diskSub = if ($null -ne $d['write']) { 'write ' + (Format-GreemonNum $d['write'] 1) + ' MB/s' } else { 'write --' }
+
+    $t1 = @(
+        (New-GreemonTile 'Speed' $spdBig $Model['speed']['note'] (Format-GreemonSpark @() $inner) $tileW),
+        (New-GreemonTile 'GPU load' $loadBig $loadSub (Format-GreemonSpark $g['util_hist'] $inner 'accent' 0 100) $tileW),
+        (New-GreemonTile 'VRAM' $vramBig $vramSub (Format-GreemonSpark $g['vram_hist'] $inner 'accent' 0 $g['vram_total']) $tileW),
+        (New-GreemonTile 'GPU temp' $tempBig '' (Format-GreemonSpark $g['temp_hist'] $inner 'amber' 20 100) $tileW 'amber')
+    )
+    $t2 = @(
+        (New-GreemonTile 'Power' $powerBig $powerSub (Format-GreemonSpark $g['power_hist'] $inner 'accent' 0 $null) $tileW),
+        (New-GreemonTile 'PCIe' $link $pcieSub (Format-GreemonSpark $g['pcie_hist'] $inner 'accent' 0 $null) $tileW),
+        (New-GreemonTile 'CPU' ((Format-GreemonNum $c['load']) + ' %') $cpuSub (Format-GreemonSpark $c['hist'] $inner 'accent' 0 100) $tileW),
+        (New-GreemonTile 'Disk read' $diskBig $diskSub (Format-GreemonSpark $d['hist'] $inner 'accent' 0 $null) $tileW)
+    )
+    $tileLines = @()
+    for ($r = 0; $r -lt 5; $r++) {
+        $line = @()
+        for ($i = 0; $i -lt 4; $i++) { if ($i) { $line += New-GreemonSeg '  ' }; $line += $t1[$i][$r] }
+        $tileLines += , (Cut-GreemonSegs $line $cw)
+    }
+    for ($r = 0; $r -lt 5; $r++) {
+        $line = @()
+        for ($i = 0; $i -lt 4; $i++) { if ($i) { $line += New-GreemonSeg '  ' }; $line += $t2[$i][$r] }
+        $tileLines += , (Cut-GreemonSegs $line $cw)
+    }
+
+    # ---- 3.9: полосы Context fill / Experts in VRAM / System RAM
+    $leftW = [int][math]::Floor($cw * 2 / 5)
+    if ($leftW -lt 24) { $leftW = 24 }
+    $ctxU = $Model['context']['used']; $ctxM = $Model['context']['max']
+    $usedFrac = $null
+    if ($null -ne $ctxU -and $ctxM) { $usedFrac = $ctxU / $ctxM }
+    $ctxTxt = (Format-GreemonK $ctxU) + ' / ' + (Format-GreemonK $ctxM)
+    if ($null -ne $usedFrac) { $ctxTxt += '  ' + ([math]::Round($usedFrac * 100)).ToString('0', [System.Globalization.CultureInfo]::InvariantCulture) + '%' }
+    $e = $Model['experts']
+    $expTxt = Format-GreemonNum $e['slots']
+    if ($null -ne $e['gb']) { $expTxt += ' ' + $dot + ' ' + ([double]$e['gb']).ToString('0.0', [System.Globalization.CultureInfo]::InvariantCulture) + ' GB' }
+    $ramUsed = $Model['ram']['used']; $ramTotal = $Model['ram']['total']
+    $ramFrac = $null
+    if ($null -ne $ramUsed -and $ramTotal) { $ramFrac = $ramUsed / $ramTotal }
+    $ramTxt = (Format-GreemonNum $ramUsed 1) + ' / ' + (Format-GreemonNum $ramTotal 0) + ' GB'
+    $ramBarStyle = 'accent'
+    if ($null -ne $ramFrac -and $ramFrac -gt 0.9) { $ramBarStyle = 'red' }
+    $leftLines = @(
+        (, (@(New-GreemonSeg 'Context fill  ' 'bold accent') + @(New-GreemonSeg $ctxTxt))),
+        (Format-GreemonBar $usedFrac $leftW 'accent'),
+        (, (@(New-GreemonSeg 'Experts in VRAM   ') + @(New-GreemonSeg $expTxt 'dim'))),
+        (Format-GreemonBar $null $leftW 'accent'),
+        (, (@(New-GreemonSeg 'System RAM        ') + @(New-GreemonSeg $ramTxt 'dim'))),
+        (Format-GreemonBar $ramFrac $leftW $ramBarStyle)
+    )
+
+    # ---- 3.10: Recent requests справа (show — как в render(): height - 20)
+    $show = $WindowHeight - 20
+    if ($show -gt 6) { $show = 6 }
+    if ($show -lt 2) { $show = 2 }
+    $rightLines = @()
+    $rightLines += , @(New-GreemonSeg 'Recent requests' 'bold accent')
+    $rightLines += (Format-GreemonRequestsTableLines $Model['recent'] $show)
+
+    $bottomLines = @()
+    $nRows = $leftLines.Count
+    if ($rightLines.Count -gt $nRows) { $nRows = $rightLines.Count }
+    for ($i = 0; $i -lt $nRows; $i++) {
+        $l = @(); if ($i -lt $leftLines.Count) { $l = Pad-GreemonSegs $leftLines[$i] $leftW }
+        $rseg = @(); if ($i -lt $rightLines.Count) { $rseg = $rightLines[$i] }
+        $bottomLines += , (Cut-GreemonSegs ($l + @(New-GreemonSeg '      ') + $rseg) $width)   # padding (0,3) в grid
+    }
+
+    # ---- порядок частей — как parts в render(): head, tabs, rule, st,
+    # state_bar, пусто, плитки, пусто нет (bottom сразу), bottom, пусто, hint;
+    # строка сообщения — как #message у MonitorApp.
+    $lines = @()
+    $lines += , $headLine
+    $lines += , $tabsLine
+    $lines += , $ruleLine
+    $lines += , $stLine
+    $lines += , $stateBarLine
+    $lines += , @()
+    foreach ($l in $tileLines) { $lines += , $l }
+    foreach ($l in $bottomLines) { $lines += , $l }
+    $lines += , @()
+    $lines += , $hintLine
+    $lines += , $msgLine
+    return , $lines
+}
+
+# Кадры в строки текста с ANSI.
+function Format-GreemonFrameText {
+    param($Lines)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ln in $Lines) {
+        $null = $sb.Append((Format-GreemonSegs $ln))
+        $null = $sb.Append("`r`n")
+    }
+    return $sb.ToString()
+}
+
+
+
+
 
 # --- 2.1: загрузка nvml.dll. Пути — из _Nvml: системный поиск (драйвер кладёт
 # nvml.dll в System32) и ProgramFiles\NVIDIA Corporation\NVSMI\nvml.dll. ---
@@ -493,7 +1188,9 @@ function Invoke-GreemonSampler {
     $i = 0
     $script:StopSampling = $false
     while (-not $script:StopSampling) {
-        Add-GreemonSampleToHistory (New-GreemonSample)
+        $sample = New-GreemonSample
+        $script:LastSample = $sample          # последние значения для модели отрисовки (фаза 3)
+        Add-GreemonSampleToHistory $sample
         $i = $i + 1
         if ($Iterations -gt 0 -and $i -ge $Iterations) { break }
         Start-Sleep -Seconds $IntervalSec
@@ -508,6 +1205,7 @@ function Initialize-GreemonData {
     foreach ($k in $HISTORY_SERIES) { $script:Hist[$k] = New-Object 'System.Collections.Generic.Queue[object]' }
     $script:MockTick = 0
     $script:StopSampling = $false
+    $script:LastSample = $null
     if ($MockForce -or $Mock) {
         $script:GpuSource = 'mock'
     } else {
@@ -548,7 +1246,24 @@ function Initialize-GreemonData {
 # доступны, а запуск не выполняется — так работают проверочные скрипты.
 # ============================================================================
 if ($MyInvocation.InvocationName -ne '.') {
-    # Фаза 2: слой данных готов; отрисовка — фаза 3, интерактивный цикл — фаза 4.
-    Write-Output 'greemon: сбор данных готов (фаза 2), отрисовка и интерактивный цикл появятся в фазах 3–4. Справка: greemon -Help'
+    # Фаза 3: слой данных + отрисовка Overview. Один кадр на каждый запуск;
+    # интерактивный цикл (альт. экран, клавиши, -Once как режим) — фаза 4.
+    $null = Initialize-GreemonData
+    $null = Invoke-GreemonSampler -IntervalSec $Interval -Iterations 2   # два снимка: CPU % по дельте
+    Initialize-GreemonRenderOptions
+    $model = New-GreemonRenderModel
+    # 3.12: размер окна читается на каждом кадре; при перенаправлении вывода
+    # консольного размера нет — берём типовые 112×32.
+    $winW = 112; $winH = 32
+    try { $winW = [Console]::WindowWidth } catch { }
+    try { $winH = [Console]::WindowHeight } catch { }
+    $lines = Format-GreemonFrame -Model $model -WindowWidth $winW -WindowHeight $winH
+    $null = Enable-GreemonConsole          # 3.1: VT в консоли, если ещё не включён
+    $null = Set-GreemonOutputEncoding      # 3.1: UTF-8 без BOM, прежнее значение помним
+    try {
+        [Console]::Out.Write((Format-GreemonFrameText $lines))
+    } finally {
+        Restore-GreemonConsole             # 3.1: восстановить режим консоли и кодировку
+    }
     exit 0
 }
