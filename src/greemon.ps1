@@ -62,8 +62,8 @@ greemon — terminal hardware monitor (GPU, CPU, RAM, disk), Strata Overview sty
 Клавиши / Keys:
   1-6     вкладки / views          /     фильтр / filter
   Space   заморозка / freeze       r     обновить / refresh
-  t       тема / theme             ?     справка / help
-  q       выход / quit
+  t       тема / theme             b     браузер, нужен -Url / browser, needs -Url
+  ?       справка / help           q     выход / quit
 '@
     Write-Output $help
 }
@@ -599,13 +599,13 @@ function New-GreemonRenderModel {
     $GIB = [math]::Pow(2, 30)
     $toGiB = { param($x) if ($null -eq $x) { $null } else { [double]$x / $GIB } }
     $histGiB = @(foreach ($x in @($hist['gpu_mem_used'].ToArray())) { if ($null -eq $x) { $null } else { [double]$x / $GIB } })
-    return @{
+    $m = @{
         state        = 'Idle'                       # 3.7: в автономном режиме всегда Idle
         phase_text   = 'Waiting for a request'      # phase_text['Idle'] в build()
         queued       = 0
         progress     = @{ done = $null; total = $null }
         context      = @{ used = $null; max = $null }
-        speed        = @{ value = $null; note = 'last request' }   # ветка Idle в build() при пустых totals/requests
+        speed        = @{ value = $null; note = 'last request'; hist = @() }   # ветка Idle в build() при пустых totals/requests
         gpu = @{
             util       = $s['gpu_util'];   util_hist  = @($hist['gpu_util'].ToArray())
             vram_used  = & $toGiB $s['gpu_mem_used']; vram_total = & $toGiB $(if ($null -ne $s['gpu_mem_total']) { $s['gpu_mem_total'] } else { $st['gpu_vram_total'] })
@@ -621,9 +621,25 @@ function New-GreemonRenderModel {
         disk = @{ read = $s['disk_read_mb']; write = $s['disk_write_mb']; hist = @($hist['disk_read_mb'].ToArray()) }
         ram  = @{ used = (& $toGiB $s['ram_used']); total = (& $toGiB $s['ram_total']) }
         experts = @{ slots = $null; total = $null; gb = $null }        # 3.9: в автономном режиме '--'
-        recent  = @()                                                  # 3.10: данных нет до фазы 6
+        recent  = @()                                                  # 3.10: пусто без сервера
         sampled_at = $(if ($null -ne $s['time']) { [double]$s['time'] } else { $null })
     }
+    # 6.1–6.4: с -Url LLM-поля (состояние, прогресс, скорость, контекст,
+    # experts, запросы, возраст замера) берутся из /metrics; аппаратные поля
+    # gpu/cpu/disk/ram остаются локальными (6.4).
+    if ($Url -and $null -ne $script:SrvModel) {
+        $sv = $script:SrvModel
+        $m['state'] = $sv['state']
+        $m['phase_text'] = $sv['phase_text']
+        $m['queued'] = $sv['queued']
+        $m['progress'] = $sv['progress']
+        $m['context'] = $sv['context']
+        $m['speed'] = $sv['speed']
+        $m['experts'] = $sv['experts']
+        $m['recent'] = $sv['recent']
+        $m['sampled_at'] = $sv['sampled_at']
+    }
+    return $m
 }
 
 # --- 3.10: таблица Recent requests — заголовки и строки, как в render():
@@ -665,7 +681,8 @@ function Format-GreemonRequestsTableLines {
 # (условие size.width >= 78 and size.height >= 23 в monitor.py). ---
 
 function Format-GreemonFrame {
-    param($Model, [int]$WindowWidth, [int]$WindowHeight, [bool]$Frozen = $false, [int]$View = 0, [object[]]$HelpLines = @())
+    param($Model, [int]$WindowWidth, [int]$WindowHeight, [bool]$Frozen = $false, [int]$View = 0, [object[]]$HelpLines = @(),
+          [string]$ConnState = 'connected', [bool]$BrowserKey = $false, [string]$Notice = '')
 
     # 3.12: минимум для Overview — 78×23, иначе одна строка.
     if ($WindowWidth -lt 78 -or $WindowHeight -lt 23) {
@@ -693,17 +710,25 @@ function Format-GreemonFrame {
     # state_color из render(): Idle → без цвета (у нас 'dim' для правого текста)
     $stateColor = switch ($state) { 'Reading' { 'blue' } 'Generating' { 'accent' } 'Queued' { 'amber' } 'Error' { 'red' } default { '' } }
 
-    # маркер [LIVE]/[STALE]/[FROZEN] (3.5): автономно — connected; LIVE → STALE,
-    # если возраст замера больше 6 секунд (как в render()).
+    # маркер [LIVE]/[STALE]/[FROZEN] (3.5, 6.3): FROZEN > AUTH REQUIRED >
+    # CONNECTING > STALE > LIVE (map connection_state в render()); LIVE →
+    # STALE, если возраст замера больше 6 секунд (как в render()).
     $marker = 'LIVE'
     if ($Frozen) { $marker = 'FROZEN' }
-    if ($null -ne $Model['sampled_at']) {
+    elseif ($ConnState -eq 'auth_required') { $marker = 'AUTH REQUIRED' }
+    elseif ($ConnState -eq 'connecting') { $marker = 'CONNECTING' }
+    elseif ($ConnState -ne 'connected') { $marker = 'STALE' }
+    if ($marker -eq 'LIVE' -and $null -ne $Model['sampled_at']) {
         $age = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 - $Model['sampled_at']
-        if ($marker -eq 'LIVE' -and $age -gt 6) { $marker = 'STALE' }
+        if ($age -gt 6) { $marker = 'STALE' }
     }
 
-    # ---- 3.5: шапка. Вместо URL — greemon; на месте модели — -Label.
-    $head = @((New-GreemonSeg 'STRATA  Overview   ' 'bold accent'), (New-GreemonSeg 'greemon   ' 'bold accent'), (New-GreemonSeg $Label 'bold'))
+    # ---- 3.5: шапка. Вместо URL — greemon; на месте модели — -Label; с -Url
+    # рядом с меткой — контекст k(max_context) (label = model + k(ctx_max) в render()).
+    $labelTxt = $Label
+    $ctxMaxHead = $Model['context']['max']
+    if ($ctxMaxHead) { $labelTxt += ' ' + (Format-GreemonK $ctxMaxHead) }
+    $head = @((New-GreemonSeg 'STRATA  Overview   ' 'bold accent'), (New-GreemonSeg 'greemon   ' 'bold accent'), (New-GreemonSeg $labelTxt 'bold'))
     $phaseTxt = $bullet + ' ' + $Model['phase_text']
     $done = $Model['progress']['done']; $total = $Model['progress']['total']
     $pct = $null
@@ -721,12 +746,19 @@ function Format-GreemonFrame {
     $tabsLine = Cut-GreemonSegs (Format-GreemonTabsSegs $View $cw) $width
     $ruleLine = @(New-GreemonSeg ($ruleCh * $cw) 'dim')
 
-    # ---- 3.11: строки клавиш и «Read only» (пункт b — без -Url убран).
-    # 4.3: «?» ставит справку поверх строки сообщения (help_lines в _paint).
-    $hintLine = @(New-GreemonSeg ('1-6 views' + '   / filter   Space freeze   r refresh   t theme   ? help   q quit') 'dim')
+    # ---- 3.11/6.5: строки клавиш и «Read only». Пункт `b open in browser`
+    # — только с сервером (-Url); без него строка как в фазе 3.
+    # 4.3: «?» ставит справку поверх строки сообщения (help_lines в _paint);
+    # notice (например, «Opened … in your browser») — между справкой и «Read only».
+    $hintTxt = '1-6 views' + '   / filter   Space freeze   r refresh   t theme'
+    if ($BrowserKey) { $hintTxt += '   b open in browser' }
+    $hintTxt += '   ? help   q quit'
+    $hintLine = @(New-GreemonSeg $hintTxt 'dim')
     $msgLines = @()
     if (@($HelpLines).Count -gt 0) {
         foreach ($hl in @($HelpLines)) { $msgLines += , @(New-GreemonSeg ([string]$hl) 'dim') }
+    } elseif ($Notice) {
+        $msgLines += , @(New-GreemonSeg $Notice 'dim')
     } else {
         $msgLines += , @(New-GreemonSeg 'Read only  |  q quits' 'dim')
     }
@@ -737,7 +769,9 @@ function Format-GreemonFrame {
         return , (@($headLine, $tabsLine, $ruleLine, @(), $stub, @(), $hintLine) + $msgLines)
     }
 
-    # ---- 3.7: полоса Model state — в автономном режиме всегда Idle
+    # ---- 3.7/6.2: полоса Model state — автономно всегда Idle; с -Url —
+    # состояние из /metrics; справа — прогресс «N / M tokens · P%» или «N queued»
+    # (render(): right_txt), полоса — доля прогресса цветом состояния.
     $st = @(New-GreemonSeg 'Model state  ' 'bold accent')
     foreach ($n in @('Idle', 'Reading', 'Generating', 'Queued', 'Error')) {
         $txt = if ($n -eq $state) { '[' + $n + ']' } else { $n }
@@ -746,12 +780,22 @@ function Format-GreemonFrame {
         elseif ($n -eq $state) { $style = 'bold' }
         $st += New-GreemonSeg ($txt + '  ') $style
     }
-    $stPad = $cw - (Get-GreemonPlain $st).Length
+    $stRight = ''
+    if ($null -ne $done -and $total) {
+        $stRight = (Format-GreemonTokens $done) + ' / ' + (Format-GreemonTokens $total) + ' tokens ' + $dot + ' ' + [string]$pct + '%'
+    } elseif ($Model['queued']) {
+        $stRight = [string][int]$Model['queued'] + ' queued'
+    }
+    $stPad = $cw - (Get-GreemonPlain $st).Length - $stRight.Length
     if ($stPad -lt 2) { $stPad = 2 }
-    $stLine = Cut-GreemonSegs ($st + @(New-GreemonSeg (' ' * $stPad) 'dim')) $width
+    $stLine = Cut-GreemonSegs ($st + @(New-GreemonSeg ((' ' * $stPad) + $stRight) 'dim')) $width
     $barW = $cw - 2
     if ($barW -lt 20) { $barW = 20 }
-    $stateBarLine = Format-GreemonBar $null $barW 'accent'
+    $stateFrac = $null
+    if ($null -ne $done -and $total) { $stateFrac = $done / $total }
+    $stateBarStyle = 'accent'
+    if ($state -ne 'Idle') { $stateBarStyle = $stateColor }
+    $stateBarLine = Format-GreemonBar $stateFrac $barW $stateBarStyle
 
     # ---- 3.8: восемь плиток 4 + 4 (тексты и форматы — из overview.py)
     $tileW = [int][math]::Floor(($cw - 3) / 4)
@@ -765,6 +809,7 @@ function Format-GreemonFrame {
     $loadSub = Get-GreemonShortGpu $g['name']
     $vramBig = (Format-GreemonNum $g['vram_used'] 1) + ' / ' + (Format-GreemonNum $g['vram_total'] 0) + ' GB'
     $vramSub = 'graphics memory'
+    if ($null -ne $Model['experts']['slots']) { $vramSub = (Format-GreemonNum $Model['experts']['slots'] 0) + ' experts cached' }
     $tempUnit = ' C'; if (-not $asciiMode) { $tempUnit = ' ' + [string][char]0x00B0 + 'C' }
     $tempBig = (Format-GreemonNum $g['temp']) + $tempUnit
     $genTxt = if ($g['pcie_gen']) { 'Gen' + [int]$g['pcie_gen'] } else { 'PCIe' }
@@ -780,7 +825,7 @@ function Format-GreemonFrame {
     $diskSub = if ($null -ne $d['write']) { 'write ' + (Format-GreemonNum $d['write'] 1) + ' MB/s' } else { 'write --' }
 
     $t1 = @(
-        (New-GreemonTile 'Speed' $spdBig $Model['speed']['note'] (Format-GreemonSpark @() $inner) $tileW),
+        (New-GreemonTile 'Speed' $spdBig $Model['speed']['note'] (Format-GreemonSpark $Model['speed']['hist'] $inner) $tileW),
         (New-GreemonTile 'GPU load' $loadBig $loadSub (Format-GreemonSpark $g['util_hist'] $inner 'accent' 0 100) $tileW),
         (New-GreemonTile 'VRAM' $vramBig $vramSub (Format-GreemonSpark $g['vram_hist'] $inner 'accent' 0 $g['vram_total']) $tileW),
         (New-GreemonTile 'GPU temp' $tempBig '' (Format-GreemonSpark $g['temp_hist'] $inner 'amber' 20 100) $tileW 'amber')
@@ -820,11 +865,14 @@ function Format-GreemonFrame {
     $ramTxt = (Format-GreemonNum $ramUsed 1) + ' / ' + (Format-GreemonNum $ramTotal 0) + ' GB'
     $ramBarStyle = 'accent'
     if ($null -ne $ramFrac -and $ramFrac -gt 0.9) { $ramBarStyle = 'red' }
+    # 6.2: Experts in VRAM — доля слотов (e['slots'] / e['total'] в render())
+    $eFrac = $null
+    if ($null -ne $e['slots'] -and $e['total']) { $eFrac = $e['slots'] / $e['total'] }
     $leftLines = @(
         (, (@(New-GreemonSeg 'Context fill  ' 'bold accent') + @(New-GreemonSeg $ctxTxt))),
         (Format-GreemonBar $usedFrac $leftW 'accent'),
         (, (@(New-GreemonSeg 'Experts in VRAM   ') + @(New-GreemonSeg $expTxt 'dim'))),
-        (Format-GreemonBar $null $leftW 'accent'),
+        (Format-GreemonBar $eFrac $leftW 'accent'),
         (, (@(New-GreemonSeg 'System RAM        ') + @(New-GreemonSeg $ramTxt 'dim'))),
         (Format-GreemonBar $ramFrac $leftW $ramBarStyle)
     )
@@ -1324,6 +1372,11 @@ function Handle-GreemonUiKey {
         $Ui['helpUntil'] = $null
         return 'redraw'
     }
+    if ($ch -eq 'b') {
+        # 6.5: «b open in browser» живёт только с -Url (action_browser в референсе)
+        if ($Url) { return 'browser' }
+        return ''
+    }
     return ''
 }
 
@@ -1369,6 +1422,13 @@ function Start-GreemonInteractiveLoop {
     $null = Set-GreemonOutputEncoding    # 3.1: UTF-8 без BOM, прежнее помним
     if ($null -eq $Out) { $Out = [Console]::Out }
 
+    # 6.1/6.3: состояние соединения с сервером на новый запуск
+    $script:SrvModel = $null
+    $script:SrvFailures = 0
+    $script:SrvNextPollAt = $null
+    $script:SrvNotice = ''
+    if ($Url) { $script:ConnState = 'connecting' } else { $script:ConnState = 'connected' }
+
     $ui = @{
         frozen   = $false
         view     = 0
@@ -1392,6 +1452,16 @@ function Start-GreemonInteractiveLoop {
                 if ($action -eq 'quit') { return }
                 if ($action -eq 'refresh') { $forceSample = $true; $dirty = $true }
                 elseif ($action -eq 'redraw') { $dirty = $true }
+                elseif ($action -eq 'browser') {
+                    # 6.5: открыть сервер в браузере (action_browser в референсе)
+                    try {
+                        Start-Process $Url
+                        $script:SrvNotice = 'Opened ' + $Url + ' in your browser'
+                    } catch {
+                        $script:SrvNotice = 'Open ' + $Url + ' in a browser (none could be started here)'
+                    }
+                    $dirty = $true
+                }
             }
 
             $now = [DateTime]::UtcNow
@@ -1400,6 +1470,9 @@ function Start-GreemonInteractiveLoop {
             }
             $due = $forceSample -or ($null -eq $nextAt) -or ($now -ge $nextAt)
             if ($due) {
+                # 6.1/6.3: опрос /metrics (с нарастающей паузой после ошибок); в
+                # референсе опрос идёт и во время заморозки, кадр при этом статичен
+                if ($Url) { Update-GreemonServerModel }
                 # «Frozen display» как в референсе: во время заморозки кадр не
                 # обновляется (action_freeze показывает последний снимок)
                 if (-not [bool]$ui['frozen']) {
@@ -1413,7 +1486,8 @@ function Start-GreemonInteractiveLoop {
                 $helpLines = @()
                 if ($ui['helpOpen']) { $helpLines = Format-GreemonHelpLines $GREEMON_HELP_LINE $winW }
                 $lines = Format-GreemonFrame -Model $model -WindowWidth $winW -WindowHeight $winH `
-                    -Frozen ([bool]$ui['frozen']) -View ([int]$ui['view']) -HelpLines $helpLines
+                    -Frozen ([bool]$ui['frozen']) -View ([int]$ui['view']) -HelpLines $helpLines `
+                    -ConnState $script:ConnState -BrowserKey ([bool]$Url) -Notice $script:SrvNotice
                 # 4.2: возврат курсора и весь кадр — одной записью, без очистки
                 $Out.Write($ESC + '[H' + (Format-GreemonFrameText $lines $winW $winH))
                 $nextAt = Get-GreemonNextFrameAt $now $nextAt $Interval
@@ -1427,7 +1501,8 @@ function Start-GreemonInteractiveLoop {
                 $helpLines = @()
                 if ($ui['helpOpen']) { $helpLines = Format-GreemonHelpLines $GREEMON_HELP_LINE $winW }
                 $lines = Format-GreemonFrame -Model $model -WindowWidth $winW -WindowHeight $winH `
-                    -Frozen ([bool]$ui['frozen']) -View ([int]$ui['view']) -HelpLines $helpLines
+                    -Frozen ([bool]$ui['frozen']) -View ([int]$ui['view']) -HelpLines $helpLines `
+                    -ConnState $script:ConnState -BrowserKey ([bool]$Url) -Notice $script:SrvNotice
                 $Out.Write($ESC + '[H' + (Format-GreemonFrameText $lines $winW $winH))
                 $dirty = $false
             }
@@ -1452,6 +1527,287 @@ function Start-GreemonInteractiveLoop {
 }
 
 # ============================================================================
+# Фаза 6. Панели LLM через сервер Strata (см. roadmap.md). Работает только
+# при -Url; без него программа остаётся чисто аппаратной. Аппаратные плитки
+# по-прежнему берутся локально, а не из /metrics (6.4).
+# ============================================================================
+
+# 6.1: таймаут запроса — 3 с, как Endpoint.timeout по умолчанию в client.py.
+$METRICS_TIMEOUT_SEC = 3.0
+
+# Ключ API: из -ApiKey, иначе из переменной окружения STRATA_API_KEY (6.1).
+# Ключ попадает только в заголовок Authorization; не печатается и не логируется.
+$script:StrataApiKey = $ApiKey
+if (-not $script:StrataApiKey -and $null -ne [Environment]::GetEnvironmentVariable('STRATA_API_KEY')) {
+    $script:StrataApiKey = [Environment]::GetEnvironmentVariable('STRATA_API_KEY')
+}
+
+# Состояние соединения с сервером (маркер шапки — 6.3):
+# connected | connecting | stale | auth_required.
+$script:ConnState = 'connected'
+$script:SrvModel = $null          # LLM-часть модели отрисовки из /metrics (6.2)
+$script:SrvFailures = 0
+$script:SrvNextPollAt = $null     # раньше этого времени не опрашиваем (пауза 6.3)
+$script:SrvNotice = ''            # сообщение строки сообщения (например, после «b»)
+$script:GreemonRand = New-Object System.Random
+
+# JSON-значение → double или $null (_num() из overview.py: bool, строка,
+# структуры, NaN и ±∞ → $null). PS 5.1 отдаёт нецелые числа из JSON как Decimal,
+# поэтому принимаем любой IConvertible-числовой тип (int/long/double/decimal/...).
+function Get-GreemonJNum {
+    param($V)
+    if ($null -eq $V) { return $null }
+    if ($V -is [bool] -or $V -is [string] -or $V -is [char]) { return $null }
+    if ($V -isnot [System.IConvertible]) { return $null }
+    try { $d = [double]$V } catch { return $null }
+    if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { return $null }
+    return $d
+}
+
+# Свойство PSCustomObject (JSON-объекта) по имени; нет объекта/свойства → $null.
+# Одноэлементный JSON-массив возвращаем через запятую: иначе return «разворачивает»
+# массив из одного элемента в сам элемент и проверки -is [Object[]] врут.
+function Get-GreemonJProp {
+    param($Obj, [string]$Name)
+    if ($null -eq $Obj) { return $null }
+    if ($Obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($null -eq $p) { return $null }
+    $v = $p.Value
+    if ($v -is [System.Array]) { return ,$v }
+    return $v
+}
+
+# JSON-объект (не массив/строка/число)? — аналог isinstance(x, dict).
+function Test-GreemonJObj {
+    param($V)
+    return ($V -is [System.Management.Automation.PSCustomObject])
+}
+
+# request_speed() из overview.py: decode_tok_s, иначе output/decode_ms при
+# output >= 2 и decode_ms > 0 (1 токен не даёт интервала декодирования).
+function Get-GreemonRequestSpeed {
+    param($R)
+    $dts = Get-GreemonJNum (Get-GreemonJProp $R 'decode_tok_s')
+    if ($null -ne $dts) { return $dts }
+    $out = Get-GreemonJNum (Get-GreemonJProp $R 'output_tokens')
+    $ms = Get-GreemonJNum (Get-GreemonJProp $R 'decode_ms')
+    if ($null -ne $out -and $out -ge 2 -and $null -ne $ms -and $ms -gt 0) {
+        return [math]::Round($out / ($ms / 1000.0), 1)
+    }
+    return $null
+}
+
+# 6.3: пауза перед повтором — формула _poll из monitor.py:
+# min(30, 2^min(failures,5) * uniform(0.8, 1.2)).
+function Get-GreemonPollDelay {
+    param([int]$Failures)
+    $jitter = 0.8 + 0.4 * $script:GreemonRand.NextDouble()
+    $d = [math]::Pow(2, [math]::Min($Failures, 5)) * $jitter
+    if ($d -gt 30) { $d = 30 }
+    return $d
+}
+
+# 6.1: GET <Url>/metrics через Invoke-RestMethod; Bearer из ключа, если задан.
+# Возвращает @{ ok; auth; data }. Ошибку не печатаем (6.3 — только маркер
+# шапки); 401/403 помечаем auth. Ключ в сообщение об ошибке не попадает.
+function Fetch-GreemonMetrics {
+    param([string]$BaseUrl)
+    $out = @{ ok = $false; auth = $false; data = $null }
+    $uri = "$BaseUrl".TrimEnd('/') + '/metrics'
+    $headers = @{ Accept = 'application/json' }
+    if ($script:StrataApiKey) { $headers['Authorization'] = 'Bearer ' + $script:StrataApiKey }
+    try {
+        $data = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -TimeoutSec $METRICS_TIMEOUT_SEC -UseBasicParsing
+    } catch {
+        $status = 0
+        try {
+            $ex = $_.Exception
+            while ($null -ne $ex -and $status -eq 0) {
+                $prop = $ex.GetType().GetProperty('Response')
+                if ($null -ne $prop) {
+                    $resp = $prop.GetValue($ex, $null)
+                    if ($null -ne $resp) {
+                        $sc = $resp.GetType().GetProperty('StatusCode')
+                        if ($null -ne $sc) { $status = [int]$sc.GetValue($resp, $null) }
+                    }
+                }
+                $ex = $ex.InnerException
+            }
+        } catch { }
+        $out['auth'] = ($status -eq 401 -or $status -eq 403)
+        return $out
+    }
+    # не-JSON/скаляр/массив на верхнем уровне — ответ не годится (как «не dict» в client.py)
+    if (-not (Test-GreemonJObj $data)) { return $out }
+    $out['ok'] = $true
+    $out['data'] = $data
+    return $out
+}
+
+# 6.2: порт LLM-части build() из hwmon\strata_cli\overview.py: state, прогресс,
+# скорость и подпись, контекст, Experts in VRAM, последние запросы (до 6),
+# ряд tok_s для спарклайна Speed, возраст замера. Аппаратная часть build()
+# (hardware/history железа) не разбирается: плитки берутся локально (6.4).
+# Нет «live»-объекта — $null (build() тоже возвращает None).
+function ConvertTo-GreemonServerModel {
+    param($Metrics)
+    $live = Get-GreemonJProp $Metrics 'live'
+    if (-not (Test-GreemonJObj $live)) { return $null }
+    $engine = Get-GreemonJProp $Metrics 'engine'
+    if (-not (Test-GreemonJObj $engine)) { $engine = $null }
+    # ВАЖНО: имена локалов не должны различаться от $HISTORY только регистром
+    # (PS не различает регистр): history → histObj.
+    $histObj = Get-GreemonJProp $Metrics 'history'
+    if (-not (Test-GreemonJObj $histObj)) { $histObj = $null }
+    $totals = Get-GreemonJProp $Metrics 'totals'
+    if (-not (Test-GreemonJObj $totals)) { $totals = $null }
+
+    # requests: только списки объектов (как isinstance(..., list) + isinstance(r, dict) в build())
+    $recentIn = @()
+    $recentRaw = Get-GreemonJProp $Metrics 'requests'
+    if ($recentRaw -is [System.Object[]]) {
+        foreach ($x in $recentRaw) { if (Test-GreemonJObj $x) { $recentIn += $x } }
+    }
+    $last = if ($recentIn.Count -gt 0) { $recentIn[0] } else { $null }
+
+    $stateRawV = Get-GreemonJProp $live 'state'
+    $stateRaw = if ($stateRawV -is [string] -and $stateRawV) { $stateRawV } else { 'idle' }
+    $queued = Get-GreemonJNum (Get-GreemonJProp $live 'queued')
+    if ($null -eq $queued) { $queued = 0 }
+    $isErr = $false
+    if (Get-GreemonJProp $engine 'error') { $isErr = $true }        # bool(engine.get("error"))
+    if ($stateRaw -eq 'error') { $isErr = $true }
+    $state = 'Idle'
+    if ($isErr) { $state = 'Error' }
+    elseif ($stateRaw -eq 'reading') { $state = 'Reading' }
+    elseif ($stateRaw -eq 'generating') { $state = 'Generating' }
+    elseif ($queued -gt 0 -and $stateRaw -ne 'reading' -and $stateRaw -ne 'generating') { $state = 'Queued' }
+    $active = ($state -eq 'Reading' -or $state -eq 'Generating')
+    $phaseText = @{ Idle = 'Waiting for a request'; Reading = 'Reading prompt'; Generating = 'Generating a reply';
+                    Queued = 'Requests are queued'; Error = 'Model unavailable' }[$state]
+
+    # прогресс: reading — prompt_read/prompt_total; generating — generated/max_tokens
+    $promptRead = Get-GreemonJNum (Get-GreemonJProp $live 'prompt_read')
+    $promptTotal = Get-GreemonJNum (Get-GreemonJProp $live 'prompt_total')
+    $generated = Get-GreemonJNum (Get-GreemonJProp $live 'generated')
+    $maxTokens = Get-GreemonJNum (Get-GreemonJProp $live 'max_tokens')
+    $done = $null; $total = $null
+    if ($state -eq 'Reading' -and $promptTotal) { $done = $(if ($null -ne $promptRead) { $promptRead } else { 0.0 }); $total = $promptTotal }
+    elseif ($state -eq 'Generating' -and $maxTokens) { $done = $(if ($null -ne $generated) { $generated } else { 0.0 }); $total = $maxTokens }
+
+    # контекст: во время запроса — prompt_tokens + generated, иначе последнего запроса
+    $maxCtx = Get-GreemonJNum (Get-GreemonJProp $engine 'max_context')
+    $ctxUsed = $null
+    $promptTokens = Get-GreemonJNum (Get-GreemonJProp $live 'prompt_tokens')
+    if ($active -and $null -ne $promptTokens -and $null -ne $generated) { $ctxUsed = $promptTokens + $generated }
+    elseif ($null -ne $last) {
+        $lp = Get-GreemonJNum (Get-GreemonJProp $last 'prompt_tokens')
+        $lo = Get-GreemonJNum (Get-GreemonJProp $last 'output_tokens')
+        if ($null -ne $lp -and $null -ne $lo) { $ctxUsed = $lp + $lo }
+    }
+
+    # скорость и подпись (ветки build()); спарклайн Speed — ряд history.tok_s
+    $speedVal = $null; $speedNote = ''
+    if ($state -eq 'Generating') {
+        $t = Get-GreemonJNum (Get-GreemonJProp $live 'tok_s')
+        if ($null -ne $t) { $speedVal = $t; $speedNote = 'now' }
+    }
+    if ($speedNote -eq '' -and $state -eq 'Reading') {
+        $p = Get-GreemonJNum (Get-GreemonJProp $live 'prefill_tok_s_mean')
+        if ($null -ne $p) { $speedVal = $p; $speedNote = 'reading the prompt' }
+    }
+    if ($speedNote -eq '') {
+        # Idle (и генерация без tok_s): среднее по totals, иначе последнего запроса
+        $tout = Get-GreemonJNum (Get-GreemonJProp $totals 'output_tokens')
+        $mst = Get-GreemonJNum (Get-GreemonJProp $totals 'decode_ms')
+        if ($null -ne $tout -and $tout -ge 2 -and $null -ne $mst -and $mst -gt 0) {
+            $speedVal = [math]::Round($tout / ($mst / 1000.0), 1); $speedNote = 'average of the run'
+        } else {
+            $speedVal = $(if ($null -ne $last) { Get-GreemonRequestSpeed $last } else { $null })
+            $speedNote = 'last request'
+        }
+    }
+    $tokHist = @()
+    $hv = Get-GreemonJProp $histObj 'tok_s'
+    if ($hv -is [System.Object[]]) {
+        $vals = @($hv)
+        if ($vals.Count -gt $HISTORY) { $vals = $vals[($vals.Count - $HISTORY)..($vals.Count - 1)] }
+        $tokHist = @(foreach ($x in $vals) { Get-GreemonJNum $x })
+    }
+
+    # Experts in VRAM: слоты, всего, кэш ГиБ (cache_mib / 1024)
+    $slots = Get-GreemonJNum (Get-GreemonJProp $engine 'expert_slots')
+    $totalSlots = Get-GreemonJNum (Get-GreemonJProp $engine 'experts')
+    $cacheMib = Get-GreemonJNum (Get-GreemonJProp $engine 'expert_cache_mib')
+    $expGb = $(if ($null -ne $cacheMib) { $cacheMib / 1024.0 } else { $null })
+
+    # последние запросы (до 6): статус, токены, скорость, длительность
+    $recent = @()
+    foreach ($r in $recentIn) {
+        if ($recent.Count -ge 6) { break }
+        $fr = Get-GreemonJProp $r 'finish_reason'
+        if ($null -eq $fr -or ($fr -is [string] -and $fr -eq '')) { $fr = Get-GreemonJProp $r 'finish' }
+        $rState = 'Done'
+        if (Get-GreemonJProp $r 'error') { $rState = 'Error' }
+        elseif ($fr -is [string] -and @('cancelled', 'error', 'abort') -contains $fr) { $rState = 'Stopped' }
+        $recent += , @{
+            time     = Get-GreemonJNum (Get-GreemonJProp $r 'time')
+            state    = $rState
+            prompt   = Get-GreemonJNum (Get-GreemonJProp $r 'prompt_tokens')
+            reused   = Get-GreemonJNum (Get-GreemonJProp $r 'reused')
+            output   = Get-GreemonJNum (Get-GreemonJProp $r 'output_tokens')
+            tps      = Get-GreemonRequestSpeed $r
+            duration = Get-GreemonJNum (Get-GreemonJProp $r 'duration_s')
+        }
+    }
+
+    return @{
+        state      = $state
+        phase_text = $phaseText
+        queued     = [int]$queued
+        progress   = @{ done = $done; total = $total }
+        context    = @{ used = $ctxUsed; max = $maxCtx }
+        speed      = @{ value = $speedVal; note = $speedNote; hist = $tokHist }
+        experts    = @{ slots = $slots; total = $totalSlots; gb = $expGb }
+        recent     = $recent
+        sampled_at = Get-GreemonJNum (Get-GreemonJProp $Metrics 'time')
+    }
+}
+
+# 6.1/6.3: один опрос /metrics с паузой после ошибок. При успехе обновляет
+# модель и снимает паузу; при ошибке — растущая пауза и состояние stale /
+# auth_required (программа не падает). В справочном monitor.py на 401/403
+# опрос прекращается совсем; roadmap 6.3 требует повтор с нарастающей паузой
+# и для них (NOTES.md).
+function Update-GreemonServerModel {
+    if (-not $Url) { return }
+    $now = [DateTime]::UtcNow
+    if ($null -ne $script:SrvNextPollAt -and $now -lt $script:SrvNextPollAt) { return }
+    $r = Fetch-GreemonMetrics $Url
+    if ($r['ok']) {
+        $m = ConvertTo-GreemonServerModel $r['data']
+        if ($null -ne $m) {
+            $script:SrvModel = $m
+            $script:ConnState = 'connected'
+            $script:SrvFailures = 0
+            $script:SrvNextPollAt = $null
+            $script:SrvNotice = ''      # сообщение (как error=None в _poll) больше не нужно
+            return
+        }
+        # ответ без «live» (старый/чужой сервер) — как ошибка сети: [STALE] (NOTES.md)
+        $auth = $false
+    } else {
+        $auth = [bool]$r['auth']
+    }
+    $script:SrvFailures = $script:SrvFailures + 1
+    if ($auth) { $script:ConnState = 'auth_required' } else { $script:ConnState = 'stale' }
+    # Пауза считается от момента после неудачи (как sleep() в _poll после запроса),
+    # иначе долгий таймаут «съедает» паузу и шлюз не держит повтор.
+    $script:SrvNextPollAt = [DateTime]::UtcNow.AddSeconds((Get-GreemonPollDelay $script:SrvFailures))
+}
+
+# ============================================================================
 # Точка входа. При точечном подключении (. greemon.ps1) определения функций
 # доступны, а запуск не выполняется — так работают проверочные скрипты.
 # ============================================================================
@@ -1460,6 +1816,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         # 4.5: -Once — один кадр в текущий поток вывода, без альтернативного
         # экрана и без клавиш, код 0 (для тестов).
         $null = Initialize-GreemonData
+        if ($Url) { Update-GreemonServerModel }        # 6.1: один запрос /metrics
         $null = Invoke-GreemonSampler -IntervalSec $Interval -Iterations 2   # два снимка: CPU % по дельте
         Initialize-GreemonRenderOptions
         $model = New-GreemonRenderModel
@@ -1468,7 +1825,8 @@ if ($MyInvocation.InvocationName -ne '.') {
         $winW = 112; $winH = 32
         try { $winW = [Console]::WindowWidth } catch { }
         try { $winH = [Console]::WindowHeight } catch { }
-        $lines = Format-GreemonFrame -Model $model -WindowWidth $winW -WindowHeight $winH
+        $lines = Format-GreemonFrame -Model $model -WindowWidth $winW -WindowHeight $winH `
+            -ConnState $script:ConnState -BrowserKey ([bool]$Url)
         $null = Enable-GreemonConsole          # 3.1: VT в консоли, если ещё не включён
         $null = Set-GreemonOutputEncoding      # 3.1: UTF-8 без BOM, прежнее значение помним
         try {
