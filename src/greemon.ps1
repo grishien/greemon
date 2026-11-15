@@ -313,6 +313,10 @@ function Initialize-GreemonRenderOptions {
     # auto → terminal у референса; в ANSI без фона terminal рисуется как dark
     # (акцент остаётся ACCENT — в render() light меняет только его).
     if ($Theme -eq 'light') { $script:ThemeResolved = 'light' } else { $script:ThemeResolved = 'dark' }
+    # кэш стиля→SGR (7.4): у Get-GreemonSgr результат зависит только от Style,
+    # ColorMode и ThemeResolved; первые два задаются здесь — кэш обнуляем тут
+    # и при смене темы (Handle-GreemonUiKey).
+    $script:SgrCache = @{}
 }
 
 # --- Стиль-сегменты: строка = массив @{t = текст; s = стиль}. Цвет подставляется
@@ -363,9 +367,12 @@ function Cut-GreemonSegs {
 }
 
 function Pad-GreemonSegs {
-    # Дополнение строки пробелами до ширины в ячейках.
+    # Дополнение строки пробелами до ширины в ячейках. Длина — сумма длин
+    # сегментов (все глифы одноширинные, см. 3.4); Gathering-строку ради .Length
+    # не собираем — на этом пути мерцает весь кадр каждые -Interval секунд.
     param($Segs, [int]$Width)
-    $len = (Get-GreemonPlain $Segs).Length
+    $len = 0
+    foreach ($g in $Segs) { $len += $g.t.Length }
     if ($len -lt $Width) { return , ($Segs + (New-GreemonSeg (' ' * ($Width - $len)))) }
     return , $Segs
 }
@@ -405,11 +412,23 @@ function Format-GreemonSpark {
     param([object[]]$Values, [int]$Width, [string]$Style = 'accent', $Lo = $null, $Hi = $null)
     $vals = @($Values)
     if ($vals.Count -gt $Width) { $vals = $vals[($vals.Count - $Width)..($vals.Count - 1)] }
-    $present = @($vals | Where-Object { $null -ne $_ })
     $pad = ' ' * ($Width - $vals.Count)
-    if ($present.Count -eq 0) { return , @(New-GreemonSeg (' ' * $Width)) }
-    $low = if ($null -ne $Lo) { [double]$Lo } else { [double](($present | Measure-Object -Minimum).Minimum) }
-    $high = if ($null -ne $Hi) { [double]$Hi } else { [double](($present | Measure-Object -Maximum).Maximum) }
+    # 7.4: min/max одним циклом вместо Where-Object/Measure-Object (конвейеры
+    # на 8 плиток × 2 кадра в секунду стоили кадра заметную часть времени)
+    $cnt = 0
+    $pLow = [double]::MaxValue
+    $pHigh = [double]::MinValue
+    foreach ($v in $vals) {
+        if ($null -ne $v) {
+            $dv = [double]$v
+            $cnt++
+            if ($dv -lt $pLow) { $pLow = $dv }
+            if ($dv -gt $pHigh) { $pHigh = $dv }
+        }
+    }
+    if ($cnt -eq 0) { return , @(New-GreemonSeg (' ' * $Width)) }
+    $low = if ($null -ne $Lo) { [double]$Lo } else { $pLow }
+    $high = if ($null -ne $Hi) { [double]$Hi } else { $pHigh }
     if ($high - $low -lt 1e-9) { $high = $low + 1.0 }
     $ramp = if ($script:GlyphSet -eq 'ascii') { '.:-=+*#@' } else { [string][char]0x2581 + [char]0x2582 + [char]0x2583 + [char]0x2584 + [char]0x2585 + [char]0x2586 + [char]0x2587 + [char]0x2588 }
     $segs = @()
@@ -657,7 +676,10 @@ function Format-GreemonRequestsTableLines {
         return , $lines
     }
     # данные запросов появятся с фазами LLM (фаза 6); форматы строк — как в render()
-    foreach ($r in @($Recent | Select-Object -First $ShowRows)) {
+    $recentArr = @($Recent)
+    $take = if ($recentArr.Count -lt $ShowRows) { $recentArr.Count } else { $ShowRows }
+    for ($j = 0; $j -lt $take; $j++) {
+        $r = $recentArr[$j]
         $stamp = if ($null -ne $r['time']) { [DateTimeOffset]::FromUnixTimeSeconds([long]$r['time']).LocalDateTime.ToString('HH:mm:ss') } else { '--' }
         $stStyle = switch ($r['state']) { 'Done' { 'accent' } 'Error' { 'red' } default { 'amber' } }
         $cells = @(
@@ -927,15 +949,35 @@ function Format-GreemonFrameText {
         if ($PadHeight -gt 0 -and $PadHeight -lt $n) { $n = $PadHeight }   # хвост за экраном всё равно ушёл бы в прокрутку
         if ($PadHeight -gt $n) { $n = $PadHeight }
     }
+    # 7.4: один проход по сегментам вместо Format-GreemonSegs + Get-GreemonPlain
+    # (два прохода и две Gathering-строки на строку кадра). SGR берётся из кэша
+    # (обнуляется в Initialize-GreemonRenderOptions и при смене темы).
+    $cache = $script:SgrCache
+    if ($null -eq $cache) { $cache = $script:SgrCache = @{} }
     $sb = New-Object System.Text.StringBuilder
     for ($i = 0; $i -lt $n; $i++) {
         if ($i) { $null = $sb.Append("`r`n") }
         $segs = if ($i -lt $arr.Count) { @($arr[$i]) } else { @() }
-        $null = $sb.Append((Format-GreemonSegs $segs))
-        if ($PadWidth -gt 0) {
-            $len = (Get-GreemonPlain $segs).Length
-            if ($len -lt $PadWidth) { $null = $sb.Append(' ' * ($PadWidth - $len)) }
+        $len = 0
+        foreach ($g in $segs) {
+            $t = [string]$g.t
+            $len += $t.Length
+            $sty = [string]$g.s
+            $sgr = ''
+            if ($sty) {
+                if ($cache.ContainsKey($sty)) { $sgr = $cache[$sty] }
+                else {
+                    $sgr = Get-GreemonSgr $sty
+                    $cache[$sty] = $sgr
+                }
+            }
+            if ($sgr) {
+                $null = $sb.Append($ESC).Append('[').Append($sgr).Append('m').Append($t).Append($ESC).Append('[0m')
+            } else {
+                $null = $sb.Append($t)
+            }
         }
+        if ($PadWidth -gt 0 -and $len -lt $PadWidth) { $null = $sb.Append(' ' * ($PadWidth - $len)) }
         if (-not $padded -and $i -eq $n - 1) { $null = $sb.Append("`r`n") }
     }
     return $sb.ToString()
@@ -1357,6 +1399,7 @@ function Handle-GreemonUiKey {
             default { 'auto' }
         }
         $script:ThemeResolved = if ($Ui['theme'] -eq 'light') { 'light' } else { 'dark' }
+        $script:SgrCache = @{}     # ключи кэша SGR зависят от темы (7.4)
         return 'redraw'
     }
     if ($ch -eq '?') {
