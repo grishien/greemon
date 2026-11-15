@@ -142,10 +142,10 @@ def run(endpoint: Endpoint, *, follow: bool, output: str, interval: float,
             if failures >= 3:
                 raise ClientError("request activity connection failed after 3 attempts", 3) from e
             if failures == 1 and not quiet:
-                print("strata: activity connection lost; retrying", file=sys.stderr)
+                print("greemon: activity connection lost; retrying", file=sys.stderr)
             continue
         if failures and not quiet:
-            print("strata: activity connection restored", file=sys.stderr)
+            print("greemon: activity connection restored", file=sys.stderr)
         failures = 0
         for event in events:
             _emit(event, machine)

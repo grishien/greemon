@@ -73,7 +73,7 @@ def _fresh_rate_sample(snapshot: dict) -> bool:
 
 
 class MonitorApp(App):
-    TITLE = "Strata Monitor"
+    TITLE = "greemon"
     CSS = """
     Screen { background: #0e1113; color: #eef1f3; }
     #shell { width: 100%; height: 100%; background: #161a1d; padding: 0 1; }
@@ -154,7 +154,7 @@ class MonitorApp(App):
         with Vertical(id="shell"):
             yield Static("", id="content", markup=False)
             yield Input(placeholder="Filter by request id, state, live or done, then Enter", max_length=80, id="filter")
-            yield Static("Read only  |  q detaches without stopping Strata", id="message", markup=False)
+            yield Static("Read only  |  q quits", id="message", markup=False)
 
     def on_mount(self) -> None:
         self._apply_theme()
@@ -238,7 +238,7 @@ class MonitorApp(App):
                 offset = 0
                 for line in content.splitlines(keepends=True):
                     stripped = line.strip()
-                    if stripped.startswith("STRATA") or stripped.startswith(("REQUEST FLOW", "GPU SENSORS", "Hardware", "Recent requests", "Slots / groups", "Occupied slots by group")):
+                    if stripped.startswith("GREEMON") or stripped.startswith(("REQUEST FLOW", "GPU SENSORS", "Hardware", "Recent requests", "Slots / groups", "Occupied slots by group")):
                         display.stylize(f"bold {accent}", offset, offset + len(line.rstrip("\n")))
                     elif stripped.startswith(("---", "Sample age", "1-6 views", "1-7 views", "Read only")):
                         display.stylize(muted, offset, offset + len(line.rstrip("\n")))
@@ -248,14 +248,13 @@ class MonitorApp(App):
                 display.highlight_regex(r"\[(?:AUTH REQUIRED|INCOMPATIBLE|DISCONNECTED|NO TELEMETRY)\]", "bold red")
                 display.highlight_regex(r"GPU \d+", f"bold {accent}")
         self.query_one("#content", Static).update(display)
-        idle_message = ("Read only  |  q keeps server on" if size.width < 60 else
-                        "Read only  |  q detaches without stopping Strata")
+        idle_message = "Read only  |  q quits"
         if self.classic and self.classic.get("tip"):             # the classic Windows console: one line about the full look
-            idle_message = ("Read only  |  q detaches  |  " if size.width >= 100 else "") + self.classic["tip"]
+            idle_message = ("Read only  |  q quits  |  " if size.width >= 100 else "") + self.classic["tip"]
         note = getattr(self, "quiet_note", None)             # one quiet line (an engine update is available), only where the screen has room for it
         if note and self.connection_state in ("connected", "stale", "telemetry_unavailable") and not self.frozen:
-            idle_message = note if size.width < 100 else f"{note}  |  q detaches without stopping Strata"
-        msg = ("\n".join(help_lines) if help_lines else None) or self.error or self.selection_notice or ("Connecting to Strata" if self.connection_state == "connecting" else
+            idle_message = note if size.width < 100 else f"{note}  |  q quits"
+        msg = ("\n".join(help_lines) if help_lines else None) or self.error or self.selection_notice or ("Connecting to the metrics endpoint" if self.connection_state == "connecting" else
                              "Telemetry unavailable; status only" if self.connection_state == "telemetry_unavailable" else
                              "Frozen display; collection continues" if self.frozen else
                              idle_message)

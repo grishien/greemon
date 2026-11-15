@@ -762,7 +762,7 @@ def render_dashboard(snapshot: dict, *, width: int, height: int, history: Monito
                    "READY" if model.get("loaded") is True else
                    "NO MODEL LOADED" if model.get("loaded") is False else "UNKNOWN")
     heading = Text()
-    heading.append("STRATA  /  MONITOR", style=f"bold {accent}")
+    heading.append("GREEMON  /  MONITOR", style=f"bold {accent}")
     heading.append("   ")
     heading.append(state, style=(f"bold {accent}" if state == "LIVE" else
                                  "bold yellow" if state in ("SLEEPING", "STALE", "CONNECTING") else
@@ -775,14 +775,14 @@ def render_dashboard(snapshot: dict, *, width: int, height: int, history: Monito
 
     if connection_state in ("connecting", "disconnected", "auth_required", "incompatible"):
         title, message, action = {
-            "connecting": ("CONNECTING", "Waiting for the first Strata telemetry snapshot.",
+            "connecting": ("CONNECTING", "Waiting for the first telemetry snapshot.",
                            "The monitor will update automatically."),
-            "disconnected": ("CONNECTION LOST", "The Strata server is not responding.",
+            "disconnected": ("CONNECTION LOST", "The metrics endpoint is not responding.",
                              "Retrying automatically; press r to retry now."),
             "auth_required": ("AUTHORIZATION REQUIRED", "The telemetry credential was rejected.",
                               "Update the saved monitor connection, then press r."),
             "incompatible": ("INCOMPATIBLE SERVER", "This telemetry schema is unsupported.",
-                             "Connect to a compatible Strata server, then press r."),
+                             "Connect to a compatible metrics endpoint, then press r."),
         }[connection_state]
         age = _age(snapshot)
         last_seen = (f"Last snapshot {number(age, 's', 1)} ago" if age is not None and age >= 0 else

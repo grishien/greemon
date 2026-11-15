@@ -101,7 +101,7 @@ class Endpoint:
     def get(self, path: str) -> dict[str, Any]:
         if path not in ("/v1/telemetry", "/v1/status", "/metrics", "/health"):
             raise ValueError("endpoint is not part of the read-only telemetry contract")
-        headers = {"Accept": "application/json", "User-Agent": "Strata-Terminal/0.1"}
+        headers = {"Accept": "application/json", "User-Agent": "greemon-terminal/0.1"}
         if self.credential:
             headers["Authorization"] = "Bearer " + self.credential
         req = urllib.request.Request(self.base_url + path, headers=headers)
@@ -122,7 +122,7 @@ class Endpoint:
                                   http_status=e.code) from e
             raise ClientError(f"telemetry request failed: HTTP {e.code}", http_status=e.code) from e
         except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as e:
-            raise ClientError(f"cannot reach Strata server: {type(e).__name__}") from e
+            raise ClientError(f"cannot reach the metrics endpoint: {type(e).__name__}") from e
         try:
             data = json.loads(body)
         except (ValueError, UnicodeDecodeError, RecursionError) as e:

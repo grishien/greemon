@@ -224,7 +224,7 @@ if ($p.ExitCode -eq 0) {
     $screen = ''
     if (Test-Path $screenFile) { $screen = (Get-Content $screenFile -Encoding UTF8 -Raw) }
     Step ($screen -match 'GREEMON75-MAIN-MARKER') ('основной экран цел: маркер рабочего виден после выхода')
-    Step (-not ($screen -match 'STRATA|Overview|GPU load')) ('основной экран цел: кадр greemon на нём не остался')
+    Step (-not ($screen -match 'GREEMON|Overview|GPU load')) ('основной экран цел: кадр greemon на нём не остался')
     Step ($kv['SMI_PROCS'] -eq '0') ('нет процессов-сирот nvidia-smi (найдено: ' + $kv['SMI_PROCS'] + ')')
 }
 Remove-Item -Recurse -Force $tmp

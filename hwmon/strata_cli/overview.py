@@ -339,7 +339,7 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
 
     # ---- heading, tabs, rule
     head = Text(no_wrap=True, overflow="crop")
-    head.append(f"STRATA  {view_label}   ", style=f"bold {accent}")
+    head.append(f"GREEMON  {view_label}   ", style=f"bold {accent}")
     head.append(connection + "   ", style=f"bold {accent}")
     label = f"{model.get('model') or ''} {k(ctx_max) if ctx_max else ''}".strip()
     head.append(label, style="bold")

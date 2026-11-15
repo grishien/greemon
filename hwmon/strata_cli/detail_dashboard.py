@@ -534,7 +534,7 @@ def _logs(snapshot: dict, *, heights: tuple[int, int, int], filter_text: str,
               _txt(""),
               _txt(f"Newest sequence {number(activity.get('last_seq'))}"),
               _txt(f"Visible after filter {len(events)}"),
-              _txt("Use strata logs for a one-shot redacted snapshot.", "dim")]
+              _txt("Press r to refresh the snapshot.", "dim")]
     return Group(_visual_pair(_panel(top_left, "LOGS / REQUEST ACTIVITY", palette["cyan"], color, top_h),
                               _panel(top_right, "CONTINUITY / SOURCE", palette["amber"], color, top_h), 1, 1),
                  _panel(timeline, "RECENT EVENT TIMELINE", palette["green"], color, mid_h),
@@ -554,7 +554,7 @@ def render_detail_dashboard(snapshot: dict, view: str, *, width: int, height: in
     state, live = _state(snapshot, connection_state, frozen)
     active = palette["green"] if state == "LIVE" else palette["amber"] if "STALE" in state else palette["red"]
     heading = Text()
-    heading.append(f"STRATA  /  {view.upper()}", style=f"bold {palette['cyan']}")
+    heading.append(f"GREEMON  /  {view.upper()}", style=f"bold {palette['cyan']}")
     heading.append("   ")
     heading.append(state, style=f"bold {active}" if color else "bold")
     heading.append(f"   {safe(connection, max(0, width - 48))}")

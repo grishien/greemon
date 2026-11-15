@@ -457,7 +457,7 @@ def render_view(snapshot: dict, view: str, width: int = 80, height: int = 24,
             marker = f"[FROZEN/{short}]" if short else "[FROZEN]"
         else:
             marker = f"[{labels[state]}]"
-    lines = [f"STRATA  {view.title():<10} {safe(connection, max(0, width - 42))} {marker}"]
+    lines = [f"GREEMON  {view.title():<10} {safe(connection, max(0, width - 42))} {marker}"]
     if tiny:       # a small window: the tabs (names kept, the selected one marked) and, under them, the keys that matter
         lines += [nav.plain(VIEWS.index(view), width, connect), f"{nav.keys(connect)} views  q quit  ? help"[:width]]
     else:
@@ -468,7 +468,7 @@ def render_view(snapshot: dict, view: str, width: int = 80, height: int = 24,
         title, message, action = {
             "connecting": ("CONNECTING", "Waiting for the first telemetry snapshot.",
                            "The monitor will update automatically."),
-            "disconnected": ("CONNECTION LOST", "Strata is not responding.",
+            "disconnected": ("CONNECTION LOST", "The metrics endpoint is not responding.",
                              "Retrying automatically; press r now."),
             "auth_required": ("AUTHORIZATION REQUIRED", "The telemetry credential was rejected.",
                               "Update the saved connection; press r."),
@@ -479,7 +479,7 @@ def render_view(snapshot: dict, view: str, width: int = 80, height: int = 24,
                      else "No telemetry snapshot available")
         lines += [title, message, action, last_seen]
         if tiny:
-            lines = lines[:height - 1] + ["More: strata status --json"]
+            lines = lines[:height - 1] + ["More: run with a wider window"]
         return "\n".join(_line(line, width) for line in lines[:height])
     if connection_state is not None and (state != "connected" or frozen):
         lines.append(f"Sample age {number(age, ' s', 1)}  |  Source {safe(snapshot.get('source'))}")
@@ -567,9 +567,9 @@ def render_view(snapshot: dict, view: str, width: int = 80, height: int = 24,
                     if events else ["No request transitions retained"]
         else:
             if not tiny:
-                lines += ["More: strata status --json"]
+                lines += ["More: run with a wider window"]
         if tiny:
-            lines = lines[:height - 1] + ["More: strata status --json"]
+            lines = lines[:height - 1] + ["More: run with a wider window"]
         return "\n".join(_line(x, width) for x in lines[:height])
     lines += [f"Model {safe(model.get('id'), max(10, width-30))}  {model_state}",
               f"In flight {number(work.get('active'))}   Slots occupied {number(work.get('occupied_slots'))}/{number(work.get('slots_effective'))}   Engine waiting {number(work.get('waiting'))}   Pre-admit {number(work.get('queued'))}"]

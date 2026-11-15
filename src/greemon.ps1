@@ -745,12 +745,12 @@ function Format-GreemonFrame {
         if ($age -gt 6) { $marker = 'STALE' }
     }
 
-    # ---- 3.5: шапка. Вместо URL — greemon; на месте модели — -Label; с -Url
-    # рядом с меткой — контекст k(max_context) (label = model + k(ctx_max) в render()).
+    # ---- 3.5: шапка. Слот названия — GREEMON (не Strata); на месте модели — -Label;
+    # с -Url рядом с меткой — контекст k(max_context) (label = model + k(ctx_max) в render()).
     $labelTxt = $Label
     $ctxMaxHead = $Model['context']['max']
     if ($ctxMaxHead) { $labelTxt += ' ' + (Format-GreemonK $ctxMaxHead) }
-    $head = @((New-GreemonSeg 'STRATA  Overview   ' 'bold accent'), (New-GreemonSeg 'greemon   ' 'bold accent'), (New-GreemonSeg $labelTxt 'bold'))
+    $head = @((New-GreemonSeg 'GREEMON  Overview   ' 'bold accent'), (New-GreemonSeg $labelTxt 'bold'))
     $phaseTxt = $bullet + ' ' + $Model['phase_text']
     $done = $Model['progress']['done']; $total = $Model['progress']['total']
     $pct = $null

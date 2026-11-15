@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone hardware monitor with the Strata Overview look (code from github.com/Niko1221/Strata, MIT).
+"""greemon — standalone hardware monitor with the Strata Overview look (code from github.com/Niko1221/Strata, MIT).
 
 Runs the unmodified Strata Textual monitor against a tiny local /metrics endpoint that is fed by Strata's own
 hardware sampler (serve/telemetry.py: NVML via ctypes, psutil). No Strata server, engine or model is needed.
